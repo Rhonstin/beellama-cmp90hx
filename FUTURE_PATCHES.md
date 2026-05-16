@@ -114,10 +114,40 @@ These tasks are specific to beellama.cpp features not present in upstream llama.
 **File**: `src/llama-speculative.cpp` or DFlash CUDA kernel  
 Check if DFlash draft cross-attention uses FP32 accumulation that could benefit from HFMA2.
 
-### 2c. TurboQuant dequant → HFMA2
+### 2c. TurboQuant dequant → HFMA2 ❌ ДОСЛІДЖЕННЯ ЗАВЕРШЕНО — PATCH НЕМОЖЛИВИЙ
 
-**File**: TurboQuant KV dequant kernel (exact file TBD)  
-If TurboQuant dequant uses FP32 FFMA, replace with HFMA2 under `#if __CUDA_ARCH__ == 860`.
+**Status**: Investigated 2026-05-16. Abandoned.
+
+#### Спроба: V_DOT2 (flash attention VKQ accumulation → half2)
+
+Увімкнули `V_DOT2_F32_F16_AVAILABLE` для CUDA sm_86 у `common.cuh`, щоб змусити
+`fattn-vec.cuh` використовувати `half2 VKQ[...]` замість `float2 VKQ[...]`.
+
+**Результат**: нуль ефекту. Жодного поліпшення ні при 50-токенному, ні при 2048-токенному контексті.
+
+#### Причина: реальний bottleneck — FWHT, не flash attention
+
+Тест при різних контекстах показав: уповільнення TurboQuant (+19–25%) **однакове** при 50 і 2048
+токенах. Flash attention dequant масштабується з контекстом — якщо б він був bottleneck,
+уповільнення зростало б з контекстом. Висновок: bottleneck **контексто-незалежний**.
+
+Справжній винуватець — `turbo_fwht_128_cuda` у `turbo-quant-cuda.cuh`:
+- 7-стадійний Fast Walsh-Hadamard Transform: 896 FP32 FADDs + 128 FMULs на 128-елементну групу
+- Викликається у `k_set_rows_turbo*` (кожен KV write) і `k_turbo*_dequant_f16_inv_fwht` (кожен decode step)
+- Всі операції FP32 FFMA — throttled 14× на CMP 90HX
+- ~2300 FP32 ops на групу, контексто-незалежний overhead
+
+#### Чому FWHT half2 неможливий
+
+FWHT акумулює похибки через 7 стадій butterfly. FP16 має range ±65504 і ~3 знаки точності.
+Після 7 стадій додавань значення переповнюються або точність деградує — це зламає якість квантизації.
+PTX inline `HADD`/`HSUB` теж не допоможе без аудиту числових меж по всіх 7 стадіях.
+
+#### Висновок
+
+TurboQuant конструктивно несумісний з CMP 90HX: алгоритм фундаментально вимагає FP32 FWHT,
+а FP32 throttled 14× в firmware. Без переписування FWHT під INT-арифметику (що змінить математику)
+net-positive результат неможливий. **Рекомендація**: використовувати `f16` KV, не TurboQuant.
 
 ---
 
