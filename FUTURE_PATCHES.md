@@ -1,7 +1,7 @@
 # CMP 90HX Optimization Roadmap
 
 **Fork**: beellama.cpp + CMP 90HX patches  
-**Last updated**: 2026-05-16 (evening — baseline + TurboQuant benchmarks done)  
+**Last updated**: 2026-05-16 (evening — baseline + TurboQuant + MTP benchmarks done)  
 **VRAM**: CMP 90HX має 10 GB VRAM. Моделі >~9B Q4_K потребують перевірки на вміщення.  
 **Purpose**: Track completed and planned optimizations for NVIDIA CMP 90HX (GA102, sm_86).  
 Check this file at the start of each work session and update it as tasks are completed.
@@ -88,7 +88,6 @@ These tasks are specific to beellama.cpp features not present in upstream llama.
 - [ ] Run DFlash speculative decoding baseline
   - `gemma-4-E4B-it-assistant.Q4_K_M.gguf` (166MB) — це **MTP head**, НЕ DFlash drafter
     - архітектура `gemma4_assistant` не підтримується beellama.cpp (тільки llama.cpp fork)
-    - для MTP: тестувати на llama.cpp fork (`-md` flag)
   - Для DFlash потрібна окрема натренована DFlash-модель для Gemma E4B (поки не знайдено публічно)
   - File results in `bench/cmp90hx/BEELLAMA_DFLASH_BENCH.md`
 
@@ -96,6 +95,15 @@ These tasks are specific to beellama.cpp features not present in upstream llama.
   - Дозволить використовувати MTP head в контексті beellama.cpp features
   - Джерело: `llama.cpp/src/llama-arch.cpp`, `llama-model.cpp`, `llama-context.h`
   - Commit у llama.cpp fork: `72f60cf85 feat: add Gemma 4 MTP assistant support`
+
+- [x] MTP speculative decoding benchmark — llama.cpp fork ✅ DONE (2026-05-16)
+  - **Результат**: baseline=65.32 tok/s, MTP=41.64 tok/s → **-36.3%** (net-negative)
+  - Accept rate: 72.8% — accept rate відмінний, але throughput гірший
+  - **Причина**: MTP verification = mini-prefill → cuBLAS SGEMM → FP32 FFMA → throttled 14×
+    Кожен крок верифікації платить GEMM penalty, що перекриває виграш від паралельного decode
+  - **Рішення**: MTP стане net-positive після Phase 3 (HFMA2 tiled GEMM для prefill/GEMM)
+  - Деталі: `bench/cmp90hx/MTP_BENCH.md`
+
 - [x] Benchmark TurboQuant KV types (`turbo4`, `turbo3`, `turbo2`) on CMP 90HX ✅ DONE
   - **Результат**: всі типи net-negative (f16 найкраще). turbo2=-16%, turbo3=-19.6%, q8_0=-25%
   - Причина: KV dequant використовує FP32 FFMA (throttled 14×), що переважає bandwidth savings
