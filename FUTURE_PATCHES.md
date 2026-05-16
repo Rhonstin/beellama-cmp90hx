@@ -86,9 +86,16 @@ These tasks are specific to beellama.cpp features not present in upstream llama.
 ### 2a. Benchmark beellama.cpp features on CMP 90HX
 
 - [ ] Run DFlash speculative decoding baseline
-  - Candidate drafter: `gemma-4-E4B-it-assistant.Q4_K_M.gguf` (166MB assistant head)
-  - Перевірити сумісність як DFlash drafter для `gemma-4-E4B-it-UD-Q4_K_XL.gguf`
+  - `gemma-4-E4B-it-assistant.Q4_K_M.gguf` (166MB) — це **MTP head**, НЕ DFlash drafter
+    - архітектура `gemma4_assistant` не підтримується beellama.cpp (тільки llama.cpp fork)
+    - для MTP: тестувати на llama.cpp fork (`-md` flag)
+  - Для DFlash потрібна окрема натренована DFlash-модель для Gemma E4B (поки не знайдено публічно)
   - File results in `bench/cmp90hx/BEELLAMA_DFLASH_BENCH.md`
+
+- [ ] Портувати `gemma4_assistant` архітектуру з llama.cpp → beellama.cpp
+  - Дозволить використовувати MTP head в контексті beellama.cpp features
+  - Джерело: `llama.cpp/src/llama-arch.cpp`, `llama-model.cpp`, `llama-context.h`
+  - Commit у llama.cpp fork: `72f60cf85 feat: add Gemma 4 MTP assistant support`
 - [x] Benchmark TurboQuant KV types (`turbo4`, `turbo3`, `turbo2`) on CMP 90HX ✅ DONE
   - **Результат**: всі типи net-negative (f16 найкраще). turbo2=-16%, turbo3=-19.6%, q8_0=-25%
   - Причина: KV dequant використовує FP32 FFMA (throttled 14×), що переважає bandwidth savings
