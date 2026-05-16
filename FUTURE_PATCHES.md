@@ -1,7 +1,7 @@
 # CMP 90HX Optimization Roadmap
 
 **Fork**: beellama.cpp + CMP 90HX patches  
-**Last updated**: 2026-05-16 (evening — baseline + TurboQuant + MTP benchmarks done)  
+**Last updated**: 2026-05-16 (night — Phase 3 investigated and abandoned; see findings)  
 **VRAM**: CMP 90HX має 10 GB VRAM. Моделі >~9B Q4_K потребують перевірки на вміщення.  
 **Purpose**: Track completed and planned optimizations for NVIDIA CMP 90HX (GA102, sm_86).  
 Check this file at the start of each work session and update it as tasks are completed.
@@ -121,35 +121,68 @@ If TurboQuant dequant uses FP32 FFMA, replace with HFMA2 under `#if __CUDA_ARCH_
 
 ---
 
-## Phase 3 — Prefill GEMM (largest remaining opportunity)
+## Phase 3 — Prefill GEMM ❌ ДОСЛІДЖЕННЯ ЗАВЕРШЕНО — PATCH НЕ ПОТРІБЕН
 
-**Status**: Not started. Complex kernel engineering required.
+**Status**: Investigated 2026-05-16. Original assumption was wrong — prefill is already fast.
 
-CMP 90HX prefill is currently catastrophically slow because cuBLAS SGEMM uses FP32 FFMA (14× throttled) and tensor cores are severely throttled (200×). A custom tiled GEMM using HFMA2 in shared memory is the only path to reasonable prefill performance.
+### Висновки (2026-05-16)
 
-### 3a. Custom HFMA2 tiled GEMM for prefill
+**Вихідна гіпотеза**: "prefill catastrophically slow because cuBLAS SGEMM uses FP32 FFMA (14×)"  
+**Реальність**: Q4_K prefill іде через MMQ kernel (tensor cores), NOT cuBLAS SGEMM.
 
-**Files**: new file `ggml/src/ggml-cuda/cmp90hx-gemm.cu`  
-**Design**:
-- 64×64 output tiles, 8×8 thread blocks
-- Load A/B tiles into `__shared__` as `half2`
-- Inner loop: `__hfma2` accumulation (unthrottled)
-- Write back converting to float
+| Path | Batch | Kernel | Instructions | pp512 result |
+|---|---|---|---|---|
+| Decode | 1 | MMVQ | DP4A → **IMAD** (patched) | 66 tok/s ✅ |
+| Prefill | >8 | MMQ | Tensor core HMMA | **503 tok/s** ✅ |
 
-**Entry point**: Replace `ggml_cuda_op_mul_mat_cublas` call for sm_86 only.
+#### Чому tensor cores FAST для prefill, незважаючи на "200× throttle":
 
-**Estimated gain**: 10–15× prefill speedup (from near-zero to usable).
+Метрика 200× — це **latency одного HMMA instruction** (284.5 ns). Але кожна HMMA інструкція
+обчислює матрицю 16×8×16 = **2048 MAC** одночасно. Ефективна TOPS:
+
+```
+HMMA (throttled):  2048 MACs / 284.5 ns = 7.2 TOPS/warp — FAST for large GEMM
+IMAD (unthrottled): 1 MAC    / 1.4 ns   = 0.7 TOPS/warp — slow for large GEMM
+```
+
+Tensor cores "throttled 200×" per instruction, але ~10× faster per MAC для великих GEMMs.
+
+#### Що відбулося при спробі Phase 3:
+
+Замінив tensor core MMA → IMAD/dp4a в MMQ kernel для sm_86 (через `CMP90HX_FORCE_DP4A`):
+- **До**: pp512 = 503 tok/s (tensor cores)
+- **Після**: pp512 = 195 tok/s (IMAD dp4a)
+- **Результат**: -61% — НАБАГАТО ГІРШЕ
+
+**Патч негайно відкинутий** (reverted via `git stash drop`).
+
+#### Де IMAD/HFMA2 ДІЙСНО допомагають (decode):
+
+- MMVQ (batch ≤ 8): пам'ять bandwidth-bound → compute майже "безкоштовний"
+  → Перехід з DP4A (35.6 ns) на IMAD (1.4 ns) = +47.6% на decode ✅
+- Tensor cores в MMVQ: занадто великий overhead для 1-8 токенів → IMAD краще
+
+#### Можливості для prefill (якщо ПОТРІБНО покращення):
+
+1. **Memory bandwidth**: CMP 90HX вже близька до bandwidth limit при pp512=503 tok/s
+   Префікс на 7B-параметрній моделі: ~4GB weights read once → ~4GB/503tok/s*512tok ≈ 4GB/s
+   CMP 90HX bandwidth: ~320 GB/s → є запас, але MMQ kernel overhead домінує
+   
+2. **Реальна проблема**: MMQ kernel overhead (quantize src1, shared mem latency) — не compute
+
+**Висновок**: Phase 3 не потрібна. Prefill вже 503+ tok/s. Фокус на Phase 2c (TurboQuant dequant → HFMA2)
+щоб розблокувати TurboQuant як net-positive для довгих контекстів.
 
 ### 3b. RMSNorm variance → half2
 
 **File**: `ggml/src/ggml-cuda/norm.cu`  
-Low priority for decode (single token), but matters for prefill and batch mode.
+Залишається low-priority. Norm FP32 FFMA throttled 14×, але норми — невеликий відсоток compute.
 
 ### 3c. ROPE application → half2
 
 **File**: `ggml/src/ggml-cuda/rope.cu`  
-`cosf`/`sinf` must stay FP32 (special function), but the rotation `x*cos - x_rot*sin`
-could use HFMA2 if input activations are in fp16. Medium impact, low risk.
+`cosf`/`sinf` must stay FP32 (special function), але rotation `x*cos - x_rot*sin`
+могла б використовувати HFMA2. Medium impact, low risk — розглянути разом з Phase 2c.
 
 ---
 
