@@ -1,7 +1,8 @@
 # CMP 90HX Optimization Roadmap
 
 **Fork**: beellama.cpp + CMP 90HX patches  
-**Last updated**: 2026-05-16  
+**Last updated**: 2026-05-16 (evening — baseline + TurboQuant benchmarks done)  
+**VRAM**: CMP 90HX має 10 GB VRAM. Моделі >~9B Q4_K потребують перевірки на вміщення.  
 **Purpose**: Track completed and planned optimizations for NVIDIA CMP 90HX (GA102, sm_86).  
 Check this file at the start of each work session and update it as tasks are completed.
 
@@ -49,19 +50,49 @@ All applied to this fork in initial commit.
 
 ---
 
+## Phase 1b — Baseline benchmarks на beellama.cpp (TODO)
+
+Перевірити всі моделі які тестувалися в llama.cpp fork, щоб отримати порівняльну базу.  
+**Пропустити**: Qwen3.6-27B-UDT-Q3_K_XL_MTP.gguf — не вміщується у 10 GB VRAM.
+
+| Модель | Файл | Раніше (llama.cpp) | Статус |
+|---|---|---|---|
+| ~~Qwen3.5-9B UD-Q4_K_XL~~ | ~~`Qwen3.5-9B-UD-Q4_K_XL.gguf`~~ | ~95 tok/s на llama.cpp | ❌ несумісний з beellama.cpp (гібридна SSM/Mamba архітектура, не підтримується) |
+| Gemma-4 E4B Q4_K_XL | `gemma-4-E4B-it-UD-Q4_K_XL.gguf` | ~66.9 tok/s (patched) | ⬜ не тестовано |
+| Gemma-4 E4B Q6_K | `gemma-4-E4B-it-Q6_K.gguf` | тестовано ізольовано | ⬜ не тестовано |
+| Gemma-4 E4B Q4_K_M | `gemma-4-E4B-it-assistant.Q4_K_M.gguf` | — | ⬜ не тестовано |
+| ~~Qwen3.6-35B-A3B Q4_K_M~~ | ~~`Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`~~ | — | ❌ виключено (MoE, див. нижче) |
+| ~~Qwen3.6-35B-A3B Q4_K_XL MTP~~ | ~~`Qwen3.6-35B-A3B-UDT-Q4_K_XL_MTP.gguf`~~ | — | ❌ виключено (MoE, див. нижче) |
+
+**Виключені моделі**:
+- `Qwen3.6-27B-*` — не вміщується у 10 GB VRAM
+- `Qwen3.6-35B-A3B-*` — MoE: лише ~27% активних параметрів потрапляє на GPU, решта CPU-offload через PCIe 1 Гб/с. Пропускна здатність стає вузьким місцем раніше ніж патч встигає дати виграш. Залишити для тестування на A2000 (більший VRAM + кращий bandwidth).
+
+**Команда для бенчмарку**:
+```bash
+/home/rhonstin/beellama-cmp90hx/build/bin/llama-bench \
+  -m /home/rhonstin/models/<MODEL>.gguf \
+  -ngl 99 -fa 1 -p 0 -n 50 2>&1 | grep "tok/s"
+```
+
+Результати зберігати у `bench/cmp90hx/BEELLAMA_BASELINE_BENCH.md`.
+
+---
+
 ## Phase 2 — Beellama-specific integration (TODO)
 
 These tasks are specific to beellama.cpp features not present in upstream llama.cpp.
 
 ### 2a. Benchmark beellama.cpp features on CMP 90HX
 
-- [ ] Run DFlash speculative decoding baseline (Qwen 3.6 27B + DFlash drafter)
-  - Expected: CMP 90HX decode is now fast enough for DFlash to be meaningful
-  - File results in `bench/cmp90hx/DFLASH_BENCH.md`
-- [ ] Benchmark TurboQuant KV types (`turbo4`, `turbo3`, `turbo2`) on CMP 90HX
-  - Previous tests on unpatched llama.cpp: turbo3 was net-negative (-6.8%)
-  - With HFMA2 decode patches, the compute/memory balance may shift
-  - File results in `bench/cmp90hx/BEELLAMA_TURBO_BENCH.md`
+- [ ] Run DFlash speculative decoding baseline
+  - Candidate drafter: `gemma-4-E4B-it-assistant.Q4_K_M.gguf` (166MB assistant head)
+  - Перевірити сумісність як DFlash drafter для `gemma-4-E4B-it-UD-Q4_K_XL.gguf`
+  - File results in `bench/cmp90hx/BEELLAMA_DFLASH_BENCH.md`
+- [x] Benchmark TurboQuant KV types (`turbo4`, `turbo3`, `turbo2`) on CMP 90HX ✅ DONE
+  - **Результат**: всі типи net-negative (f16 найкраще). turbo2=-16%, turbo3=-19.6%, q8_0=-25%
+  - Причина: KV dequant використовує FP32 FFMA (throttled 14×), що переважає bandwidth savings
+  - Рішення: пропатчити TurboQuant dequant → HFMA2 (Phase 2c)
 
 ### 2b. DFlash hidden-state accumulation HFMA2
 
