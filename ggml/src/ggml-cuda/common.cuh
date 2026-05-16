@@ -694,7 +694,27 @@ static __device__ __forceinline__ int ggml_cuda_dp4a(const int a, const int b, i
 
 #else // defined(GGML_USE_HIP)
 
-#if __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
+#if __CUDA_ARCH__ == 860
+    // sm_86 (CMP 90HX): DP4A is throttled 29×; expand to 4×IMAD + 6×IADD via PTX
+    asm volatile(
+        "{ .reg .s32 t0, t1, t2, t3;\n"
+        "  bfe.s32   t0, %1,  0, 8;\n"
+        "  bfe.s32   t1, %1,  8, 8;\n"
+        "  bfe.s32   t2, %1, 16, 8;\n"
+        "  bfe.s32   t3, %1, 24, 8;\n"
+        "  .reg .s32 u0, u1, u2, u3;\n"
+        "  bfe.s32   u0, %2,  0, 8;\n"
+        "  bfe.s32   u1, %2,  8, 8;\n"
+        "  bfe.s32   u2, %2, 16, 8;\n"
+        "  bfe.s32   u3, %2, 24, 8;\n"
+        "  mad.lo.s32 %0, t0, u0, %3;\n"
+        "  mad.lo.s32 %0, t1, u1, %0;\n"
+        "  mad.lo.s32 %0, t2, u2, %0;\n"
+        "  mad.lo.s32 %0, t3, u3, %0; }"
+        : "=r"(c) : "r"(a), "r"(b), "r"(c)
+    );
+    return c;
+#elif __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
     return __dp4a(a, b, c);
 #else // __CUDA_ARCH__ >= GGML_CUDA_CC_DP4A || defined(GGML_USE_MUSA)
     const int8_t * a8 = (const int8_t *) &a;

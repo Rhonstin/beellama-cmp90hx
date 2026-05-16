@@ -1,10 +1,50 @@
-# Anbeeld's BeeLlama.cpp
+# Anbeeld's BeeLlama.cpp — CMP 90HX Edition
 
 ![BeeLlama.cpp logo](beellama.jpg)
 
 BeeLlama.cpp (or just Bee) is a performance-focused llama.cpp fork for squeezing more speed and context out of local GGUF inference. It keeps the familiar llama.cpp tools and server flow, then adds DFlash speculative decoding, adaptive draft control, TurboQuant/TCQ KV-cache compression, and reasoning-loop protection, with full multimodal support.
 
+This fork additionally patches the CUDA backend for **NVIDIA CMP 90HX** (GA102, sm_86), replacing firmware-throttled instructions (DP4A, FP32 FFMA) with unthrottled equivalents (IMAD, HFMA2).
+
 > Not quite a pegasus, but close enough.
+
+---
+
+## CMP 90HX Optimizations
+
+The CMP 90HX (GA102, sm_86) has a firmware that throttles certain CUDA instructions:
+
+| Instruction | Latency | Status |
+|---|---|---|
+| FFMA / FADD / FMUL | 17.8 ns | throttled 14–15× |
+| DP4A | 35.6 ns | throttled 29× |
+| IMAD / IADD | 1.4 ns | **unthrottled** |
+| HFMA2 / HADD2 | 1.3–1.4 ns | **unthrottled** |
+| Tensor cores | 284.5 ns | severely throttled — disabled |
+
+### Applied patches
+
+| Patch | File | Impact |
+|---|---|---|
+| DP4A → PTX IMAD (4×mad.lo.s32) | `ggml/src/ggml-cuda/common.cuh` | +47.6% decode (42→62 tok/s) |
+| FP32 dequant → HFMA2 (Q4_K, Q5_K) | `ggml/src/ggml-cuda/vecdotq.cuh` | +7.1% additional |
+| FP32 dequant → HFMA2 (Q6_K, Q2_K) | `ggml/src/ggml-cuda/vecdotq.cuh` | +4.2% additional |
+| fattn DKQ=512 → tile kernel | `ggml/src/ggml-cuda/fattn.cu` | crash fix for Gemma4 |
+
+**Cumulative gain vs unpatched**: ~+58% on Q4_K models, ~+87% on dense Q4_K_XL models.
+
+Benchmark data in [`bench/cmp90hx/`](bench/cmp90hx/README.md). Future patch roadmap in [`FUTURE_PATCHES.md`](FUTURE_PATCHES.md).
+
+### Build for CMP 90HX
+
+```bash
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=86 \
+  -DGGML_CUDA_FA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc) --target llama-bench llama-server
+```
+
+---
 
 Here's a [plug-and-play Qwen 3.6 27B setup](docs/quickstart-qwen36-dflash.md) with a config to run it in Q5 + 200k of practically lossless KV cache + vision on a single RTX 3090 or 4090.
 

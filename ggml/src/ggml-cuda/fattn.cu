@@ -1334,10 +1334,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
             if (V->ne[0] != K->ne[0]) {
                 return BEST_FATTN_KERNEL_NONE;
             }
-            if (!gqa_opt_applies) {
-                return BEST_FATTN_KERNEL_NONE;
-            }
-            break;
+            // MMA path aborts for DKQ>256; tile kernel supports D=512 natively
+            return BEST_FATTN_KERNEL_TILE;
         case 576:
             if (V->ne[0] != 512) {
                 return BEST_FATTN_KERNEL_NONE;
