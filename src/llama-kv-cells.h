@@ -3,6 +3,7 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <array>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -15,6 +16,10 @@ struct llama_kv_cell_ext {
     llama_pos x = 0;
     llama_pos y = 0;
 
+    // when tok = LLAMA_TOKEN_NULL when the cell is produced by embedding input (i.e. multimodal)
+    // use case: n-gram embeddings hash
+    llama_token tok = LLAMA_TOKEN_NULL;
+
     // return true if the current 2D spatial position is greater than other
     bool is_2d_gt(llama_pos ox, llama_pos oy) const {
         return (y > oy) || (y == oy && x > ox);
@@ -23,7 +28,7 @@ struct llama_kv_cell_ext {
     void reset() {
         static_assert(std::is_trivially_copyable_v<llama_kv_cell_ext>);
 
-        memset(this, 0, sizeof(*this));
+        *this = llama_kv_cell_ext{};
     }
 };
 
@@ -46,6 +51,7 @@ public:
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
         }
+        seq_used.fill(0);
     }
 
     void reset_shift() {
@@ -318,6 +324,38 @@ public:
         return seq[i].test(seq_id);
     }
 
+    // Number of live cache cells that are members of seq_id. Keep this with
+    // seq_pos so coverage queries do not scan the cache.
+    uint32_t seq_size(llama_seq_id seq_id) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        return seq_used[seq_id];
+    }
+
+    // gather the token ids of the cells in `seqs` with position in [p0, p1)
+    // the callback receives (seq_id, pos, token) for every such (cell, seq) pair
+    // note: used by n-gram input embeddings to recover the tokens preceding a ubatch
+    template<typename F>
+    void for_each_token_in(const std::bitset<LLAMA_MAX_SEQ> & seqs, llama_pos p0, llama_pos p1, F && f) const {
+        for (const auto & i : used) {
+            if (pos[i] < p0 || pos[i] >= p1) {
+                continue;
+            }
+
+            const auto m = seq[i] & seqs;
+            if (m.none()) {
+                continue;
+            }
+
+            for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (m.test(s)) {
+                    f(s, pos[i], ext[i].tok);
+                }
+            }
+        }
+    }
+
     // note: call only if the cell is not empty and the seq_id is not in the cell
     void seq_add(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
@@ -522,12 +560,16 @@ private:
     //  - some vision models have input embeddings with repeating positions
     //
     std::map<llama_pos, int> seq_pos[LLAMA_MAX_SEQ];
+    std::array<uint32_t, LLAMA_MAX_SEQ> seq_used {};
 
     // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, llama_pos p) {
         auto it = seq_pos[s].find(p);
         assert(it != seq_pos[s].end());
+        assert(seq_used[s] > 0);
+
+        --seq_used[s];
 
         if (--it->second == 0) {
             seq_pos[s].erase(it);
@@ -536,6 +578,7 @@ private:
 
     void seq_pos_inc(llama_seq_id s, llama_pos p) {
         seq_pos[s][p]++;
+        seq_used[s]++;
     }
 
     // remove cell i
@@ -556,3 +599,5 @@ private:
         }
     }
 };
+
+using llama_kv_cells_vec = std::vector<llama_kv_cells>;

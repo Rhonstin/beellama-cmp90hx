@@ -43,7 +43,8 @@ struct mmf_ids_data {
 
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
 
-bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * scr0_ne, const size_t * src0_nb, const int src1_ncols, bool mul_mat_id);
+bool ggml_cuda_should_use_mmf(enum ggml_type type, int cc, int warp_size, const int64_t * scr0_ne,
+    const size_t * src0_nb, const ggml_tensor * src1, const int src1_ncols, bool mul_mat_id);
 
 template <typename T, int rows_per_block, int cols_per_block, int nwarps, bool has_ids>
 __launch_bounds__(ggml_cuda_get_physical_warp_size()*nwarps, 1)
@@ -91,7 +92,7 @@ static __global__ void mul_mat_f(
     const int row0        = blockIdx.x * rows_per_block;
 
     int expert_idx = 0;
-    int col_base = 0;
+    [[maybe_unused]] int col_base = 0;
 
     const int channel_dst = has_ids ? 0 : blockIdx.y;
 
@@ -122,12 +123,12 @@ static __global__ void mul_mat_f(
         ids += col_offset * stride_row_id;
     }
 
-    const float2 * y2 = (const float2 *) y;
+    [[maybe_unused]] const float2 * y2 = (const float2 *) y;
 
     extern __shared__ char data_mmv[];
 
     char * shmem_base = data_mmv;
-    int  * slot_map   = (int *) shmem_base;
+    [[maybe_unused]] int * slot_map = (int *) shmem_base;
     char * compute_base = has_ids ? (shmem_base + GGML_PAD(cols_per_block, 16) * sizeof(int)) : shmem_base;
 
     tile_C C[ntA][ntB];

@@ -3,9 +3,11 @@
 #define MAX_GRIDDIM_X 0x7FFFFFFF
 
 static __global__ void scale_f32(const float * x, float * dst, const float scale, const float bias, const int64_t nelements) {
+    ggml_cuda_pdl_lc();
     int64_t tid = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
     int64_t stride = (int64_t)blockDim.x * (int64_t)gridDim.x;
 
+    ggml_cuda_pdl_sync();
     for (int64_t i = tid; i < nelements; i += stride) {
         dst[i] = scale * x[i] + bias;
     }
@@ -22,7 +24,8 @@ static __global__ void scale_bf16(const nv_bfloat16 * x, nv_bfloat16 * dst, cons
 
 static void scale_f32_cuda(const float * x, float * dst, const float scale, const float bias, const int64_t nelements, cudaStream_t stream) {
     const int64_t num_blocks = (nelements + CUDA_SCALE_BLOCK_SIZE - 1) / CUDA_SCALE_BLOCK_SIZE;
-    scale_f32<<<MIN(MAX_GRIDDIM_X, num_blocks), CUDA_SCALE_BLOCK_SIZE, 0, stream>>>(x, dst, scale, bias, nelements);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(MIN(MAX_GRIDDIM_X, num_blocks), CUDA_SCALE_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(scale_f32, launch_params, x, dst, scale, bias, nelements);
 }
 
 static void scale_bf16_cuda(const nv_bfloat16 * x, nv_bfloat16 * dst, const float scale, const float bias, const int64_t nelements, cudaStream_t stream) {

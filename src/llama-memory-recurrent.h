@@ -23,6 +23,7 @@ public:
                          bool   offload,
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
+                     uint32_t   n_rs_seq,
         const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
@@ -42,16 +43,13 @@ public:
 
     void clear(bool data) override;
 
+    bool can_seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const override;
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     bool seq_rm_cell(llama_seq_id seq_id, uint32_t cell_idx) override;
 
     int cells_at_pos(llama_seq_id seq_id, llama_pos pos, uint32_t * cell_indices, int n_max) override;
 
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
-    void seq_cp_recurrent(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override {
-        seq_cp(seq_id_src, seq_id_dst, p0, p1);
-    }
-    void seq_cp_recurrent_no_sync(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1);
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
@@ -67,24 +65,24 @@ public:
     bool find_slot(const llama_ubatch & ubatch);
 
     bool get_can_shift() const override;
+    seq_rm_capability get_seq_rm_capability() const override;
 
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
-    // cell management for speculative decoding checkpoint/restore
-    void copy_cell(int32_t i_src, int32_t i_dst);
-    int  get_cell_count(llama_seq_id seq_id) const;
-
-    bool copy_cell_synchronize = true;
-
-    bool expand(uint32_t new_mem_size);
-    bool shrink(uint32_t new_mem_size);
-
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
+
+    // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
+    uint32_t n_rs_seq = 0;
+
+    // per-seq rollback index
+    std::vector<uint32_t> rs_idx;
+
+    void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // computed before each graph build
     uint32_t n = 0;
@@ -140,7 +138,8 @@ private:
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
-    bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
+    bool state_read_data(llama_io_read_i & io, uint32_t cell_count, uint32_t restore_head);
+
 };
 
 class llama_memory_recurrent_context : public llama_memory_context_i {

@@ -1,97 +1,101 @@
-# llama.cpp INI Presets
+# BeeLlama INI presets
 
-## Introduction
+Presets store reusable llama.cpp arguments in an INI file. Use them with the
+router server when several models need different paths, cache policies, or
+speculative settings:
 
-The INI preset feature, introduced in [PR#17859](https://github.com/ggml-org/llama.cpp/pull/17859), allows users to create reusable and shareable parameter configurations for llama.cpp.
-
-### Using Presets with the Server
-
-When running multiple models on the server (router mode), INI preset files can be used to configure model-specific parameters. Please refer to the [server documentation](../tools/server/README.md) for more details.
-
-### Using a Remote Preset
-
-> [!NOTE]
->
-> This feature is currently only supported via the `-hf` option.
-
-For GGUF models hosted on Hugging Face, you can include a `preset.ini` file in the root directory of the repository to define specific configurations for that model.
-
-Example:
-
-```ini
-hf-repo-draft = username/my-draft-model-GGUF
-temp = 0.5
-top-k = 20
-top-p = 0.95
+```powershell
+llama-server --models-preset .\models.ini
 ```
 
-For security reasons, only certain options are allowed. Please refer to [preset.cpp](../common/preset.cpp) for the complete list of permitted options.
+The exact preset argument and preset-only defaults are listed in the
+[BeeLlama argument reference](beellama-args.md#presets).
 
-Example usage:
+## File format
 
-Assuming your repository `username/my-model-with-preset` contains a `preset.ini` with the configuration above:
-
-```sh
-llama-cli -hf username/my-model-with-preset
-
-# This is equivalent to:
-llama-cli -hf username/my-model-with-preset \
-  --hf-repo-draft username/my-draft-model-GGUF \
-  --temp 0.5 \
-  --top-k 20 \
-  --top-p 0.95
-```
-
-You can also override preset arguments by specifying them on the command line:
-
-```sh
-# Force temp = 0.1, overriding the preset value
-llama-cli -hf username/my-model-with-preset --temp 0.1
-```
-
-If you want to define multiple preset configurations for one or more GGUF models, you can create a blank HF repo for each preset. Each HF repo should contain a `preset.ini` file that references the actual model(s):
-
-```ini
-hf-repo = user/my-model-main
-hf-repo-draft = user/my-model-draft
-temp = 0.8
-ctx-size = 1024
-; (and other configurations)
-```
-
-### Named presets
-
-If you want to define multiple preset configurations for one or more GGUF models, you can create a blank HF repo containing a single `preset.ini` file that references the actual model(s):
+- Write option names without leading dashes: `ctx-size`, not `--ctx-size`.
+- Put shared values in `[*]`.
+- Put each named model in its own section.
+- Later command-line arguments override values loaded from the selected preset.
+- `load-on-startup` and `stop-timeout` are preset-only keys; they are not CLI
+  arguments.
 
 ```ini
 [*]
-mmap = 1
+mmap       = 1
+kv-unified = 1
+parallel   = 1
 
-[gpt-oss-20b-hf]
+[Qwen-DFlash-KVarN]
+model                  = D:/models/qwen.gguf
+spec-type              = draft-dflash
+spec-draft-model       = D:/models/qwen-dflash.gguf
+spec-dm-controller     = profit
+cache-type-k            = kvarn4
+cache-type-v            = kvarn4
+flash-attn              = on
+reasoning-loop-guard    = force-close
+load-on-startup         = 1
+stop-timeout            = 10
+```
+
+This DFlash1 example omits `spec-draft-n-max`, so the drafter uses
+`dflash.block_size - 1` and the default-on profit controller adapts within that
+limit. Add `spec-draft-n-max = N` when a fixed upper bound is required; add
+`spec-dm-controller = off` when the resolved or explicit DFlash1 depth must
+remain static. DFlash2 always uses its fixed trained block limit and selector
+confidence.
+
+## Router model selection
+
+The section name is the router model name. A shared section can define ordinary
+server defaults, while each model section supplies its own model source and
+overrides:
+
+```ini
+[*]
+ctx-size    = 32768
+batch-size  = 1024
+ubatch-size = 512
+
+[qwen-local]
+model        = D:/models/qwen.gguf
+cache-type-k = kvarn4
+cache-type-v = kvarn4
+
+[gpt-oss-hf]
 hf          = ggml-org/gpt-oss-20b-GGUF
-batch-size  = 2048
-ubatch-size = 2048
+temp        = 1.0
 top-p       = 1.0
 top-k       = 0
-min-p       = 0.01
-temp        = 1.0
-chat-template-kwargs = {"reasoning_effort": "high"}
-
-[gpt-oss-120b-hf]
-hf          = ggml-org/gpt-oss-120b-GGUF
-batch-size  = 2048
-ubatch-size = 2048
-top-p       = 1.0
-top-k       = 0
-min-p       = 0.01
-temp        = 1.0
-chat-template-kwargs = {"reasoning_effort": "high"}
 ```
 
-You can then use it via `llama-cli` or `llama-server`, example:
+`load-on-startup = 1` autoloads a section. The total number of startup sections
+must not exceed `--models-max` unless that upstream limit is configured as
+unlimited.
 
-```sh
-llama-server -hf user/repo:gpt-oss-120b-hf
+## Remote presets
+
+A Hugging Face preset repository contains `preset.ini` at its root and points
+to the actual model repositories from its named sections. Load it through the
+normal `-hf` flow:
+
+```powershell
+llama-server -hf user/preset-repository
 ```
 
-Please make sure to provide the correct `hf-repo` for each child preset. Otherwise, you may get error: `The specified tag is not a valid quantization scheme.`
+Remote presets can select models and server options. Use only repositories you
+trust, and inspect `preset.ini` before deployment.
+
+Do not place `hf-token` in a preset. It is a sensitive option and is omitted
+from preset serialization and public router metadata. Supply `HF_TOKEN` in the
+router environment (or `--hf-token` at startup); child model processes receive
+only the environment value, never a token-bearing argv entry.
+
+## BeeLlama migration rules
+
+New presets must use `draft-dflash`, standard q cache names, or `kvarnN` target
+cache names. Do not carry forward TurboQuant/TCQ formats,
+`spec-dflash-cross-ctx`, tree-verifier settings, `GGML_DFLASH_*` variables, or
+`GGML_CUDA_FA_HALF_QUANTS`. The complete redirect and removal list is in
+[Migration from earlier versions](beellama-args.md#migration-from-earlier-versions).

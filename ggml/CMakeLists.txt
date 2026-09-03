@@ -4,8 +4,8 @@ project("ggml" C CXX ASM)
 
 ### GGML Version
 set(GGML_VERSION_MAJOR 0)
-set(GGML_VERSION_MINOR 10)
-set(GGML_VERSION_PATCH 1)
+set(GGML_VERSION_MINOR 22)
+set(GGML_VERSION_PATCH 0)
 set(GGML_VERSION_BASE "${GGML_VERSION_MAJOR}.${GGML_VERSION_MINOR}.${GGML_VERSION_PATCH}")
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
@@ -205,18 +205,126 @@ set   (GGML_CUDA_PEER_MAX_BATCH_SIZE "128" CACHE STRING
 option(GGML_CUDA_NO_PEER_COPY               "ggml: do not use peer to peer copies"            OFF)
 option(GGML_CUDA_NO_VMM                     "ggml: do not try to use CUDA VMM"                OFF)
 option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention CUDA kernels"  ON)
-option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
+option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile full K/V cache quant pair matrix for FlashAttention"     OFF)
+option(GGML_CUDA_KVARN                      "ggml: compile CUDA KVarN kernels"                                        ON)
+unset(GGML_CUDA_KVARN_FA CACHE)
+unset(GGML_CUDA_KVARN_FAST_DECODE_ALL_PAIRS CACHE)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
 option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
-                                            "ggml: cuda link binary compression mode; requires cuda 12.8+")
+                                            "ggml: cuda link binary compression mode; CUDA 12.4-12.7 support size via compress-all")
 set_property(CACHE GGML_CUDA_COMPRESSION_MODE PROPERTY STRINGS "none;speed;balance;size")
+
+set(GGML_CUDA_KVARN_DEFAULT_PAIRS
+    k8-v8
+    k8-v6
+    k8-v5
+    k6-v6
+    k6-v5
+    k6-v4
+    k5-v5
+    k5-v4
+    k5-v3
+    k4-v4
+    k4-v3
+    k4-v2
+    k3-v3
+    k3-v2
+    k2-v2
+)
+
+list(LENGTH GGML_CUDA_KVARN_DEFAULT_PAIRS GGML_CUDA_KVARN_DEFAULT_PAIR_COUNT)
+if (NOT GGML_CUDA_KVARN_DEFAULT_PAIR_COUNT EQUAL 15)
+    message(FATAL_ERROR "Default KVarN fast decode policy expected 15 pairs, got ${GGML_CUDA_KVARN_DEFAULT_PAIR_COUNT}")
+endif()
+set(GGML_CUDA_KVARN_ALL_PAIR_COUNT 36)
+
+function(ggml_cuda_select_kvarn_fast_decode_sources OUT_VAR PREFIX)
+    set(_sources ${ARGN})
+
+    if (NOT GGML_CUDA_KVARN)
+        list(FILTER _sources EXCLUDE REGEX "fattn-mma-kvarn")
+        set(${OUT_VAR} ${_sources} PARENT_SCOPE)
+        return()
+    endif()
+
+    if (GGML_CUDA_FA_ALL_QUANTS)
+        set(_selected_sources ${_sources})
+        set(_expected_pair_count ${GGML_CUDA_KVARN_ALL_PAIR_COUNT})
+    else()
+        set(_selected_sources)
+        foreach(SRC ${_sources})
+            if (NOT SRC MATCHES "fattn-mma-kvarn-decode-instance-")
+                list(APPEND _selected_sources "${SRC}")
+            endif()
+        endforeach()
+
+        foreach(PAIR ${GGML_CUDA_KVARN_DEFAULT_PAIRS})
+            list(APPEND _selected_sources "${PREFIX}/fattn-mma-kvarn-decode-instance-${PAIR}.cu")
+        endforeach()
+        set(_expected_pair_count ${GGML_CUDA_KVARN_DEFAULT_PAIR_COUNT})
+    endif()
+
+    set(_selected_decode_sources ${_selected_sources})
+    list(FILTER _selected_decode_sources INCLUDE REGEX "fattn-mma-kvarn-decode-instance-")
+    list(LENGTH _selected_decode_sources _selected_pair_count)
+    if (NOT _selected_pair_count EQUAL _expected_pair_count)
+        message(FATAL_ERROR
+            "KVarN fast decode selected ${_selected_pair_count} pair instances; expected ${_expected_pair_count}")
+    endif()
+
+    set(${OUT_VAR} ${_selected_sources} PARENT_SCOPE)
+endfunction()
+
+function(ggml_cuda_get_fattn_vec_default_pairs OUT_VAR)
+    set(_types_8 q8_0)
+    set(_types_6 q6_1 q6_0)
+    set(_types_5 q5_1 q5_0)
+    set(_types_4 q4_1 q4_0)
+    set(_types_3 q3_1 q3_0)
+    set(_types_2 q2_1 q2_0s)
+
+    # Homogeneous F16/BF16 pairs cover KVarN and standard precision tails.
+    set(_pairs f16:f16 bf16:bf16)
+    foreach(PAIR ${GGML_CUDA_KVARN_DEFAULT_PAIRS})
+        if (NOT PAIR MATCHES "^k([0-9]+)-v([0-9]+)$")
+            message(FATAL_ERROR "Invalid KVarN default pair: ${PAIR}")
+        endif()
+        set(K_BITS ${CMAKE_MATCH_1})
+        set(V_BITS ${CMAKE_MATCH_2})
+        set(K_TYPES_VAR _types_${K_BITS})
+        set(V_TYPES_VAR _types_${V_BITS})
+        set(K_TYPES ${${K_TYPES_VAR}})
+        set(V_TYPES ${${V_TYPES_VAR}})
+        list(LENGTH K_TYPES K_TYPE_COUNT)
+        list(LENGTH V_TYPES V_TYPE_COUNT)
+        math(EXPR K_TYPE_LAST "${K_TYPE_COUNT} - 1")
+        math(EXPR V_TYPE_LAST "${V_TYPE_COUNT} - 1")
+
+        foreach(K_INDEX RANGE 0 ${K_TYPE_LAST})
+            list(GET K_TYPES ${K_INDEX} K_TYPE)
+            foreach(V_INDEX RANGE 0 ${V_TYPE_LAST})
+                list(GET V_TYPES ${V_INDEX} V_TYPE)
+                if (K_BITS EQUAL V_BITS AND K_INDEX GREATER V_INDEX)
+                    continue()
+                endif()
+                list(APPEND _pairs "${K_TYPE}:${V_TYPE}")
+            endforeach()
+        endforeach()
+    endforeach()
+
+    list(LENGTH _pairs _pair_count)
+    if (NOT _pair_count EQUAL 50)
+        message(FATAL_ERROR "Default CUDA FA vec policy expected 50 pairs, got ${_pair_count}")
+    endif()
+
+    set(${OUT_VAR} ${_pairs} PARENT_SCOPE)
+endfunction()
 
 option(GGML_HIP                             "ggml: use HIP"                                   OFF)
 option(GGML_HIP_GRAPHS                      "ggml: use HIP graph"                              ON)
 option(GGML_HIP_RCCL                        "ggml: use ROCm Collective Comm. Library"         OFF)
 option(GGML_HIP_NO_VMM                      "ggml: do not try to use HIP VMM"                 ON)
-option(GGML_HIP_ROCWMMA_FATTN               "ggml: enable rocWMMA for FlashAttention"         OFF)
 option(GGML_HIP_MMQ_MFMA                    "ggml: enable MFMA MMA for CDNA in MMQ"           ON)
 option(GGML_HIP_EXPORT_METRICS              "ggml: enable kernel perf metrics output"         OFF)
 option(GGML_MUSA_GRAPHS                     "ggml: use MUSA graph, experimental, unstable"    OFF)
@@ -244,11 +352,13 @@ set   (GGML_METAL_MACOSX_VERSION_MIN "" CACHE STRING
                                             "ggml: metal minimum macOS version")
 set   (GGML_METAL_STD "" CACHE STRING       "ggml: metal standard version (-std flag)")
 option(GGML_OPENMP                          "ggml: use OpenMP"                                ON)
+option(GGML_OPENMP_FETCH                    "ggml: fetch LLVM OpenMP"                         OFF)
 option(GGML_RPC                             "ggml: use RPC"                                   OFF)
 option(GGML_SYCL                            "ggml: use SYCL"                                  OFF)
 option(GGML_SYCL_F16                        "ggml: use 16 bit floats for sycl calculations"   OFF)
 option(GGML_SYCL_GRAPH                      "ggml: enable graphs in the SYCL backend"         ON)
 option(GGML_SYCL_HOST_MEM_FALLBACK          "ggml: allow host memory fallback in SYCL reorder (requires kernel 6.8+)" ON)
+option(GGML_SYCL_SUPPORT_LEVEL_ZERO_API     "ggml: use Level Zero API in SYCL backend"  ON)
 option(GGML_SYCL_DNN                        "ggml: enable oneDNN in the SYCL backend"         ON)
 set   (GGML_SYCL_TARGET "INTEL" CACHE STRING
                                             "ggml: sycl target device")
@@ -256,6 +366,8 @@ set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
                                             "ggml: sycl device architecture")
 
 option(GGML_OPENVINO                        "ggml: use OPENVINO"                              OFF)
+option(GGML_ET                              "ggml: use ET backend"                            OFF)
+option(GGML_ET_SYSEMU                       "ggml: use ET backend via sysemu"                 OFF)
 
 option(GGML_OPENCL                          "ggml: use OpenCL"                                OFF)
 option(GGML_OPENCL_PROFILING                "ggml: use OpenCL profiling (increases overhead)" OFF)
@@ -265,7 +377,6 @@ set   (GGML_OPENCL_TARGET_VERSION "300" CACHE STRING
                                             "ggml: OpenCL API version to target")
 
 option(GGML_HEXAGON                         "ggml: enable Hexagon backend"                    OFF)
-set(GGML_HEXAGON_FP32_QUANTIZE_GROUP_SIZE 128 CACHE STRING "ggml: quantize group size (32, 64, or 128)")
 
 # toolchain for vulkan-shaders-gen
 set   (GGML_VULKAN_SHADERS_GEN_TOOLCHAIN "" CACHE FILEPATH "ggml: toolchain file for vulkan-shaders-gen")
@@ -340,9 +451,6 @@ set(GGML_PUBLIC_HEADERS
     include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
-#if (GGML_METAL)
-#    set_target_properties(ggml PROPERTIES RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/ggml-metal.metal")
-#endif()
 install(TARGETS ggml LIBRARY PUBLIC_HEADER)
 install(TARGETS ggml-base LIBRARY)
 
@@ -352,7 +460,7 @@ if (GGML_STANDALONE)
         @ONLY)
 
     install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml.pc
-        DESTINATION share/pkgconfig)
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
 endif()
 
 #
@@ -401,7 +509,7 @@ configure_package_config_file(
               GGML_BIN_INSTALL_DIR)
 
 write_basic_package_version_file(
-        ${CMAKE_CURRENT_BINARY_DIR}/ggml-version.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/ggml-config-version.cmake
     VERSION ${GGML_INSTALL_VERSION}
     COMPATIBILITY SameMajorVersion)
 
@@ -413,7 +521,7 @@ message(STATUS "ggml version: ${GGML_INSTALL_VERSION}")
 message(STATUS "ggml commit:  ${GGML_BUILD_COMMIT}")
 
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/ggml-config.cmake
-              ${CMAKE_CURRENT_BINARY_DIR}/ggml-version.cmake
+              ${CMAKE_CURRENT_BINARY_DIR}/ggml-config-version.cmake
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ggml)
 
 if (MSVC)

@@ -1,6 +1,5 @@
 #include "common.cuh"
 #include "fattn-tile.cuh"
-#include "fattn-wmma-f16.cuh"
 
 void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * K = dst->src[1];
@@ -33,6 +32,10 @@ void ggml_cuda_flash_attn_ext_tile(ggml_backend_cuda_context & ctx, ggml_tensor 
         case 128: {
             GGML_ASSERT(V->ne[0] == K->ne[0]);
             ggml_cuda_flash_attn_ext_tile_case<128, 128>(ctx, dst);
+        } break;
+        case 192: {
+            GGML_ASSERT(V->ne[0] == 128);
+            ggml_cuda_flash_attn_ext_tile_case<192, 128>(ctx, dst);
         } break;
         case 256: {
             GGML_ASSERT(V->ne[0] == K->ne[0]);

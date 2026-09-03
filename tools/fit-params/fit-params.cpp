@@ -12,7 +12,10 @@
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
-int main(int argc, char ** argv) {
+// satisfies -Wmissing-declarations
+int llama_fit_params(int argc, char ** argv);
+
+int llama_fit_params(int argc, char ** argv) {
     common_params params;
 
     common_init();
@@ -25,12 +28,28 @@ int main(int argc, char ** argv) {
     llama_numa_init(params.numa);
 
     auto mparams = common_model_params_to_llama(params);
+    const bool bee_tail_request = params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED ||
+            params.kv_tail_tokens != "0";
+    std::unique_ptr<llama_kv_tail_request, decltype(&llama_kv_tail_request_free)> tail_request(
+            bee_tail_request ? llama_kv_tail_request_init(
+                    params.kv_tail_tokens.c_str(), params.kv_tail_type) : nullptr,
+            llama_kv_tail_request_free);
+    if (tail_request && llama_kv_tail_request_last_error(tail_request.get())[0] != '\0') {
+        LOG_ERR("%s: invalid KV tail request: %s\n", __func__,
+                llama_kv_tail_request_last_error(tail_request.get()));
+        return 1;
+    }
     auto cparams = common_context_params_to_llama(params);
+    if (tail_request) {
+        cparams.kv_tail_tokens = 0;
+        cparams.kv_tail_request = tail_request.get();
+    }
 
     if (!params.fit_params_print) {
         const common_params_fit_status status = common_fit_params(params.model.path.c_str(), &mparams, &cparams,
                 params.tensor_split, params.tensor_buft_overrides.data(), params.fit_params_target.data(), params.fit_params_min_ctx,
-                params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+                nullptr,
+                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         if (status != COMMON_PARAMS_FIT_STATUS_SUCCESS) {
             LOG_ERR("%s: failed to fit CLI arguments to free memory, exiting...\n", __func__);
             exit(1);

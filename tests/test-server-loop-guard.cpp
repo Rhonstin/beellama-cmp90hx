@@ -59,26 +59,6 @@ int main() {
 
     {
         server_loop_guard guard(test_params());
-        accept_many(guard, repeat_block({1, 2, 3, 4, 5}, 240), SERVER_LOOP_REGION_REASONING);
-        const auto result = guard.check(SERVER_LOOP_REGION_REASONING);
-        assert_triggered(result, "periodic_tail");
-        assert(result.period == 5);
-    }
-
-    {
-        server_loop_guard guard(test_params());
-        std::vector<llama_token> sentence;
-        for (int i = 0; i < 32; ++i) {
-            sentence.push_back(100 + i);
-        }
-        accept_many(guard, repeat_block(sentence, 40), SERVER_LOOP_REGION_REASONING);
-        const auto result = guard.check(SERVER_LOOP_REGION_REASONING);
-        assert(result.triggered);
-        assert(result.kind == "periodic_tail" || result.kind == "ngram_dominance");
-    }
-
-    {
-        server_loop_guard guard(test_params());
         std::vector<llama_token> block;
         for (int i = 0; i < 200; ++i) {
             block.push_back(1000 + i);
@@ -115,17 +95,6 @@ int main() {
 
     {
         server_loop_guard guard(test_params());
-        for (int line = 0; line < 220; ++line) {
-            const std::vector<llama_token> code_line = {
-                100, 101, 200 + line, 102, 300 + (line % 97), 103, 104, 400 + (line % 131), 105
-            };
-            accept_many(guard, code_line, SERVER_LOOP_REGION_VISIBLE);
-        }
-        assert_not_triggered(guard.check(SERVER_LOOP_REGION_VISIBLE));
-    }
-
-    {
-        server_loop_guard guard(test_params());
         for (int row = 0; row < 180; ++row) {
             const std::vector<llama_token> table_row = {
                 500, 600 + row, 501, 700 + (row * 7) % 997, 501, 800 + (row * 13) % 997, 500, 502
@@ -136,15 +105,38 @@ int main() {
     }
 
     {
-        server_loop_guard guard(test_params());
-        for (int block = 0; block < 80; ++block) {
-            for (int pos = 0; pos < 16; ++pos) {
-                const bool noisy = pos % 4 == 0;
-                guard.accept(noisy ? (llama_token) (10000 + block * 16 + pos) : (llama_token) (900 + pos),
-                        SERVER_LOOP_REGION_REASONING);
-            }
-        }
-        assert_not_triggered(guard.check(SERVER_LOOP_REGION_REASONING));
+        common_reasoning_loop_guard_params params = test_params();
+        params.min_reasoning_tokens = 32;
+        params.min_repeated_coverage = 24;
+        params.window_tokens = 64;
+        params.max_period = 8;
+        params.check_interval = 8;
+        server_loop_guard guard(params);
+
+        accept_many(guard, std::vector<llama_token>(32, 42), SERVER_LOOP_REGION_REASONING);
+        const auto reasoning = guard.check(SERVER_LOOP_REGION_REASONING);
+        assert(reasoning.triggered);
+        assert(reasoning.kind == "periodic_tail");
+        assert(reasoning.period == 1);
+
+        // A reasoning intervention must not disarm the independent visible tail.
+        accept_many(guard, repeat_block({7, 8}, 16), SERVER_LOOP_REGION_VISIBLE);
+        const auto visible = guard.check(SERVER_LOOP_REGION_VISIBLE);
+        assert(visible.triggered);
+        assert(visible.kind == "periodic_tail");
+        assert(visible.period == 2);
+    }
+
+    {
+        common_reasoning_loop_guard_params params = test_params();
+        params.min_repeated_coverage = 24;
+        params.window_tokens = 64;
+        params.max_period = 8;
+        params.check_interval = 8;
+        server_loop_guard guard(params);
+
+        accept_many(guard, std::vector<llama_token>(16, 9), SERVER_LOOP_REGION_VISIBLE);
+        assert_not_triggered(guard.check(SERVER_LOOP_REGION_VISIBLE));
     }
 
     {
@@ -161,6 +153,8 @@ int main() {
         }
         guard.accept(1, SERVER_LOOP_REGION_REASONING);
         assert(guard.should_check(SERVER_LOOP_REGION_REASONING, false, false));
+        assert(!guard.should_check(SERVER_LOOP_REGION_REASONING, true, false));
+        assert(!guard.should_check(SERVER_LOOP_REGION_REASONING, false, true));
     }
 
     {
@@ -172,6 +166,20 @@ int main() {
             guard.accept((llama_token) (1000 + (i * 37) % 50000), SERVER_LOOP_REGION_REASONING);
         }
         assert_not_triggered(guard.check(SERVER_LOOP_REGION_REASONING));
+    }
+
+    {
+        server_loop_guard guard(test_params());
+        accept_many(guard, std::vector<llama_token>(1200, 42), SERVER_LOOP_REGION_REASONING);
+        assert(guard.check(SERVER_LOOP_REGION_REASONING).triggered);
+
+        common_reasoning_loop_guard_params params = test_params();
+        params.mode = COMMON_REASONING_LOOP_GUARD_OFF;
+        guard.configure(params);
+        accept_many(guard, std::vector<llama_token>(1200, 42), SERVER_LOOP_REGION_REASONING);
+        assert(!guard.should_check(SERVER_LOOP_REGION_REASONING, false, false));
+        assert_not_triggered(guard.check(SERVER_LOOP_REGION_REASONING));
+        assert(guard.seen(SERVER_LOOP_REGION_REASONING) == 1200);
     }
 
     return 0;

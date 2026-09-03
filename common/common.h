@@ -6,13 +6,18 @@
 
 #include "ggml-opt.h"
 #include "ggml.h"
+#include "llama.h"
 
+#include <list>
 #include <set>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
 #include <map>
+#include <algorithm>
+#include <fstream>
+#include <functional>
 
 #if defined(_WIN32) && !defined(_WIN32_WINNT)
 #define _WIN32_WINNT 0x0A00
@@ -23,6 +28,13 @@
 #else
 #define DIRECTORY_SEPARATOR '/'
 #endif // _WIN32
+
+#define COM_DBG(fmt, ...) LOG_DBG("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define COM_TRC(fmt, ...) LOG_TRC("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define COM_INF(fmt, ...) LOG_INF("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define COM_WRN(fmt, ...) LOG_WRN("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define COM_ERR(fmt, ...) LOG_ERR("cmn  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
+#define COM_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
 
 #define die(msg)          do { fputs("error: " msg "\n", stderr);                exit(1); } while (0)
 #define die_fmt(fmt, ...) do { fprintf(stderr, "error: " fmt "\n", __VA_ARGS__); exit(1); } while (0)
@@ -95,6 +107,8 @@ enum llama_example {
     LLAMA_EXAMPLE_FIT_PARAMS,
     LLAMA_EXAMPLE_RESULTS,
     LLAMA_EXAMPLE_EXPORT_GRAPH_OPS,
+    LLAMA_EXAMPLE_DOWNLOAD,
+    LLAMA_EXAMPLE_TOKENIZE,
 
     LLAMA_EXAMPLE_COUNT,
 };
@@ -157,17 +171,16 @@ enum common_params_sampling_config : uint64_t {
 
 enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
-    COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
-    COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
-    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,  // standalone draft model speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,  // Eagle3 speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // Multi-token prediction
+    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,  // DFlash speculative decoding
+    COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,  // DSpark speculative decoding (DFlash + Markov head)
+    COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding based on n-grams
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,   // self-speculative decoding with n-gram keys only
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
-    COMMON_SPECULATIVE_TYPE_SUFFIX,        // model-free suffix tree speculative decoding
-    COMMON_SPECULATIVE_TYPE_COPYSPEC,      // model-free copy-from-context speculative decoding
-    COMMON_SPECULATIVE_TYPE_RECYCLE,       // model-free token recycling (adjacency matrix)
-    COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash block-diffusion speculative decoding
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -224,14 +237,14 @@ struct common_params_sampling {
     float   temp               = 0.80f;  // <= 0.0 to sample greedily, 0.0 to not output probabilities
     float   dynatemp_range     = 0.00f;  // 0.0 = disabled
     float   dynatemp_exponent  = 1.00f;  // controls how entropy maps to temperature in dynamic temperature sampler
-    int32_t penalty_last_n     = 64;     // last n tokens to penalize (0 = disable penalty, -1 = context size)
+    int32_t penalty_last_n     = 64;     // last n tokens to penalize (0 = disable penalty)
     float   penalty_repeat     = 1.00f;  // 1.0 = disabled
     float   penalty_freq       = 0.00f;  // 0.0 = disabled
     float   penalty_present    = 0.00f;  // 0.0 = disabled
     float   dry_multiplier     = 0.0f;   // 0.0 = disabled;      DRY repetition penalty for tokens extending repetition:
     float   dry_base           = 1.75f;  // 0.0 = disabled;      multiplier * base ^ (length of sequence before token - allowed length)
     int32_t dry_allowed_length = 2;      // tokens extending repetitions beyond this receive penalty
-    int32_t dry_penalty_last_n = -1;     // how many tokens to scan for repetitions (0 = disable penalty, -1 = context size)
+    int32_t dry_penalty_last_n = 64;     // how many tokens to scan for repetitions (0 = disable penalty)
     float   adaptive_target    = -1.0f;  // select tokens near this probability (valid range 0.0 to 1.0; negative = disabled)
     float   adaptive_decay     = 0.90f;  // EMA decay for adaptation; history ≈ 1/(1-decay) tokens (0.0 - 0.99)
     int32_t mirostat           = 0;      // 0 = disabled, 1 = mirostat, 2 = mirostat 2.0
@@ -274,49 +287,57 @@ struct common_params_sampling {
 
     // reasoning budget sampler parameters
     // these are populated by the server/CLI based on chat template params
-    int32_t                  reasoning_budget_tokens   = -1;   // -1 = disabled, >= 0 = token budget
-    std::vector<llama_token> reasoning_budget_start;           // start tag token sequence
-    std::vector<llama_token> reasoning_budget_end;             // end tag token sequence
-    std::vector<llama_token> reasoning_budget_forced;          // forced sequence (message + end tag)
-    std::string              reasoning_budget_message;         // message injected before end tag when budget exhausted
-    bool                     reasoning_budget_tracking = false; // track reasoning state even with unlimited budget
+    int32_t                   reasoning_budget_tokens   = -1;  // -1 = disabled, >= 0 = token budget
+    std::vector<llama_token>  reasoning_budget_start;          // start tag token sequence
+    std::vector<llama_tokens> reasoning_budget_end;            // end tag token sequences; the first tag is used as the forcing sequence
+    std::vector<llama_token>  reasoning_budget_forced;         // forced sequence (message + first end tag)
+    std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
+    bool                      reasoning_budget_tracking = false; // track reasoning state even with an unlimited budget
+    bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;
-
-    bool has_logit_bias() const {
-        return !logit_bias.empty();
-    }
 
     // print the parameters into a string
     std::string print() const;
 };
 
 struct common_params_model {
-    std::string path        = ""; // model local path                                       // NOLINT
-    std::string url         = ""; // model url to download                                  // NOLINT
-    std::string hf_repo     = ""; // HF repo                                                // NOLINT
-    std::string hf_file     = ""; // HF file                                                // NOLINT
-    std::string docker_repo = ""; // Docker repo                                            // NOLINT
-    std::string name        = ""; // in format <user>/<model>[:<tag>] (tag is optional)     // NOLINT
-};
+    std::string path        = ""; // model local path
+    std::string url         = ""; // model url to download
+    std::string hf_repo     = ""; // HF repo
+    std::string hf_file     = ""; // HF file
+    std::string docker_repo = ""; // Docker repo
 
-struct common_ngram_mod;
+    std::string get_name() const {
+        if (!hf_repo.empty()) {
+            return hf_repo;
+        }
+        if (!docker_repo.empty()) {
+            return docker_repo;
+        }
+        return path;
+    }
+
+    bool empty() const {
+        return get_name().empty();
+    }
+};
 
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
-    int32_t n_max = 16; // maximum number of tokens to draft during speculative decoding
-    int32_t n_min = 0;  // minimum number of draft tokens to use for speculative decoding
+    int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
+    int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
-    float p_split = 0.1f;  // speculative decoding split probability
-    float p_min   = 0.0f;  // minimum speculative decoding probability (greedy)
+    float p_split = 0.1f; // speculative decoding split probability
+    float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
+
+    bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
     common_params_model mparams;
 
-    llama_model * model = nullptr; // a llama_model that can be shared by multiple speculative contexts
+    llama_context * ctx_tgt = nullptr;
+    llama_context * ctx_dft = nullptr;
 
-    llama_context_params cparams; // these are the parameters for the draft llama_context
-
-    int32_t n_ctx        = 0;  // draft context size
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
@@ -327,7 +348,6 @@ struct common_params_speculative_draft {
 
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
-    std::vector<std::pair<std::string, std::string>> replacements; // main to speculative model replacements
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 };
 
@@ -336,9 +356,6 @@ struct common_params_speculative_ngram_mod {
 
     int32_t n_max = 64;
     int32_t n_min = 48;
-
-    // shared instance of the ngram container for all speculative decoding contexts
-    std::shared_ptr<common_ngram_mod> obj;
 };
 
 struct common_params_speculative_ngram_map {
@@ -352,15 +369,21 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+// Upstream remains authoritative for all draft modes. BeeLlama's adaptive
+// draft-max controller only chooses the next DFlash1 horizon; DFlash2 keeps
+// its fixed trained block limit and selector confidence.
 enum common_speculative_dm_controller {
-    COMMON_SPECULATIVE_DM_CONTROLLER_FRINGE,
+    COMMON_SPECULATIVE_DM_CONTROLLER_OFF,
     COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT,
 };
 
 struct common_params_speculative {
-    // TODO: become a vector in order to support "chains of speculators"
-    common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE;
+    std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
+    double synth_len = -1.0;
+    std::vector<double> synth_rates;
+
+    // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
     common_params_speculative_ngram_mod ngram_mod;
@@ -370,70 +393,41 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
-    // DFlash-specific params (top-level for fork compat)
-    int32_t n_max        = 16; // maximum number of tokens to draft during speculative decoding
-    int32_t n_max_base   = 0;  // user's original --draft-max before adaptive DM reduction (0 = use n_max)
-    int32_t n_min        = 0;  // minimum number of draft tokens to use for speculative decoding
-    int32_t branch_budget = 0; // DDTree branch nodes beyond the main draft path (0 = flat DFlash)
-    int32_t tree_budget   = -1; // legacy total-node --tree-budget input; normalized after parsing
-    bool    branch_budget_explicit = false;
-    bool    legacy_tree_budget_explicit = false;
-    int32_t dflash_max_slots = 1; // max concurrent server slots that keep DFlash state
-    float   p_split = 0.1f;   // speculative decoding split probability
-    float   p_min   = 0.0f;   // minimum speculative decoding probability (0 = disabled)
-    float   sample_temp = 0.0f; // drafter sampling temperature (0 = greedy, >0 = Gumbel sampling)
-    int32_t draft_topk  = 1;   // top-K candidates per drafter position (1 = argmax only)
-    int32_t dflash_cross_ctx = 512; // DFlash cross-attention window: tokens of target hidden states the drafter sees (default: 512)
-
-    // adaptive draft-max management
-    bool    dm_adaptive         = true;  // enable adaptive draft-max
-    float   dm_fringe_min       = 0.30f;// fringe below this → DFlash off (after off-dwell)
-    float   dm_fringe_max       = 0.50f;// fringe above this → full base_n_max
-    int32_t dm_off_dwell        = 8;    // consecutive weak cycles before going off
-    int32_t dm_explore_interval = 12;   // cycles between exploration drafts
-    int32_t dm_min_reach        = 3;    // fringe controller: min current-epoch samples before promotion
-    int32_t dm_probe_interval   = 16;   // cycles to wait before probing at n_max=0
-    float   dm_probe_fraction   = 0.25f;// fraction of base n_max to use as probe when disabled
-    int32_t dm_fringe_window    = 3;    // fringe controller: trailing positions to average over
+    // Adaptive DFlash draft horizon.  "profit" is the only retained Bee
+    // controller; the old fringe controller was coupled to the retired fork
+    // verifier and is intentionally not part of the v0.4.0 API.
+    bool draft_n_max_explicit = false;
     common_speculative_dm_controller dm_controller = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
-    float   dm_profit_min          = 0.05f;
-    float   dm_profit_raise_margin = 0.05f;
-    float   dm_profit_lower_margin = 0.05f;
-    float   dm_profit_ewma_alpha   = 0.15f;
-    int32_t dm_profit_min_samples  = 3;
-    int32_t dm_profit_warmup       = 0;     // positive-depth warmup cycles after baseline seeding (0 = auto from min_samples)
-    int32_t dm_profit_baseline_interval = 1024; // active spec cycles between no-spec baseline reprobes (0 = disabled)
-
-    // DFlash draft model (separate from upstream's draft.model)
-    struct common_params_model mparams_dft;
-    llama_model * model_dft = nullptr;
-    llama_context_params cparams_dft;
-
-    // copyspec: copy from context
-    int32_t copyspec_gamma      = 6;    // window size for rolling hash match
-
-    // token recycling: adjacency matrix
-    int32_t recycle_k            = 8;    // top-k successors per token
-
-    // suffix tree speculative decoding
-    int32_t suffix_max_depth    = 64;   // maximum depth of suffix tree
-    float   suffix_spec_factor  = 2.0f; // max_spec = factor * match_len + offset
-    float   suffix_spec_offset  = 0.0f; // additive offset for max speculative tokens
-    float   suffix_min_prob     = 0.1f; // prune branches below this probability
+    float   dm_profit_min               = 0.05f;
+    float   dm_profit_raise_margin      = 0.05f;
+    float   dm_profit_lower_margin      = 0.05f;
+    float   dm_profit_ewma_alpha        = 0.15f;
+    int32_t dm_profit_min_samples       = 3;
+    int32_t dm_profit_warmup            = 0;
+    int32_t dm_profit_baseline_interval = 1024;
 
     bool has_dft() const {
-        return !draft.mparams.path.empty() || !draft.mparams.hf_repo.empty();
+        return !draft.mparams.empty();
+    }
+
+    bool has_synth() const {
+        return synth_len != -1.0 || !synth_rates.empty();
+    }
+
+    uint32_t need_n_rs_seq() const {
+        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        });
+
+        return needs_rs_seq ? draft.n_max : 0u;
     }
 };
 
-struct common_params_vocoder {
-    struct common_params_model model;
-
-    std::string speaker_file; // speaker file path
-
-    bool use_guide_tokens = false; // enable guide tokens to improve TTS accuracy
-};
-
+// Resolve Bee's omitted DFlash draft maximum before target-context allocation.
+// Returns false when the draft GGUF metadata cannot be read or is invalid.
+bool common_speculative_resolve_dflash_draft_n_max(
+        common_params_speculative & params,
+        const std::string & draft_model_path);
 struct common_params_diffusion {
     int32_t steps         = 128;
     bool    visual_mode   = false;
@@ -468,13 +462,17 @@ enum common_reasoning_loop_guard_mode {
 
 struct common_reasoning_loop_guard_params {
     common_reasoning_loop_guard_mode mode = COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE;
-    int32_t min_reasoning_tokens = 1024;
-    int32_t window_tokens = 2048;
-    int32_t max_period = 512;
-    int32_t min_repeated_coverage = 768;
-    int32_t check_interval = 32;
-    int32_t interventions_max = 1;
+    int32_t min_reasoning_tokens = 512;
+    int32_t window_tokens = 1024;
+    int32_t max_period = 128;
+    int32_t min_repeated_coverage = 256;
+    int32_t check_interval = 64;
+    int32_t interventions_max = 2;
 };
+
+common_reasoning_loop_guard_mode common_reasoning_loop_guard_mode_from_name(const std::string & value);
+const char * common_reasoning_loop_guard_mode_name(common_reasoning_loop_guard_mode value);
+void common_validate_reasoning_loop_guard_params(const common_reasoning_loop_guard_params & params);
 
 
 struct lr_opt {
@@ -504,6 +502,8 @@ struct common_params {
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
     int32_t n_sequences           =     1; // number of sequences to decode
+    int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
+    int32_t n_outputs_max_per_seq =     1; // max outputs per sequence
     int32_t grp_attn_n            =     1; // group-attention factor
     int32_t grp_attn_w            =   512; // group-attention width
     int32_t n_print               =    -1; // print token count every n tokens (-1 = disabled)
@@ -529,6 +529,9 @@ struct common_params {
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
+    enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
+
+    enum llama_tensor_read_lazy tensor_read_lazy = LLAMA_TENSOR_READ_LAZY_AUTO; // on-demand reading of tensors marked by the arch
 
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
@@ -542,19 +545,16 @@ struct common_params {
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings
     enum llama_attention_type    attention_type    = LLAMA_ATTENTION_TYPE_UNSPECIFIED; // attention type for embeddings
     enum llama_flash_attn_type   flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_AUTO; // whether to use Flash Attention
-    bool no_fused_gdn = false;
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;
-    common_reasoning_loop_guard_params reasoning_loop_guard;
-    struct common_params_vocoder     vocoder;
     struct common_params_diffusion   diffusion;
 
     struct common_params_model model;
 
     std::set<std::string> model_alias;     // model aliases                                                 // NOLINT
     std::set<std::string> model_tags;      // model tags (informational, not used for routing)              // NOLINT
-    std::string hf_token             = ""; // HF token                                                      // NOLINT
+    std::string hf_token             = ""; // HF token (aka bearer token)                                   // NOLINT
     std::string prompt               = "";                                                                  // NOLINT
     std::string system_prompt        = "";                                                                  // NOLINT
     std::string prompt_file          = ""; // store the external prompt file name                           // NOLINT
@@ -562,6 +562,7 @@ struct common_params {
     std::string input_prefix         = ""; // string to prefix user inputs with                             // NOLINT
     std::string input_suffix         = ""; // string to suffix user inputs with                             // NOLINT
     std::string logits_file          = ""; // file for saving *all* logits                                  // NOLINT
+    std::string path_prompts_log_dir = ""; // directory with logged prompts                                 // NOLINT
 
     // llama-debug specific options
     std::string logits_output_dir = "data"; // directory for saving logits output files                     // NOLINT
@@ -620,9 +621,6 @@ struct common_params {
     bool kv_unified        = false; // enable unified KV cache
 
     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
-    bool use_mmap          = true;  // enable mmap to use filesystem cache
-    bool use_direct_io     = false; // read from disk without buffering
-    bool use_mlock         = false; // use mlock to keep model in memory
     bool verbose_prompt    = false; // print prompt tokens before generation
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
@@ -637,15 +635,45 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // Kept unresolved until the target model's canonical cache groups are known.
+    std::string kv_tail_tokens = "0";
+    ggml_type   kv_tail_type   = GGML_TYPE_COUNT;
+
+    // KVarN is selected by its pseudo cache-type names in the argument parser.
+    // The backing ggml types remain the matching standard q formats for layers
+    // that are not eligible for structured KVarN storage.
+    int32_t cache_kvarn_bits_k = 0;
+    int32_t cache_kvarn_bits_v = 0;
+    int32_t cache_kvarn_swa_bits_k = 0;
+    int32_t cache_kvarn_swa_bits_v = 0;
+    llama_kvarn_params kvarn = {
+        /*.type                =*/ LLAMA_KVARN_TYPE_DISABLED,
+        /*.key_bits            =*/ 0,
+        /*.value_bits          =*/ 0,
+        /*.swa_key_bits        =*/ 0,
+        /*.swa_value_bits      =*/ 0,
+        /*.group               =*/ 128,
+        /*.sinkhorn_iters      =*/ 16,
+        /*.sink_tokens         =*/ 128,
+        /*.fail_if_unsupported =*/ true,
+    };
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)
     struct common_params_model mmproj;
-    bool mmproj_use_gpu = true;     // use GPU for multimodal model
-    bool no_mmproj = false;         // explicitly disable multimodal model
-    std::vector<std::string> image; // path to image file(s)
+    bool mmproj_use_gpu = true;                 // use GPU for multimodal model
+    ggml_backend_dev_t mmproj_device = nullptr; // GPU device to use for multimodal model
+    bool no_mmproj = false;                     // explicitly disable multimodal model
+    std::vector<std::string> image;             // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;
     int image_max_tokens = -1;
+    int mtmd_batch_max_tokens = 1024;
+
+    // for video input
+    float       video_fps                   = 4.0f;
+    int64_t     video_timestamp_interval_ms = 5000;
+    std::string video_ffmpeg_bin_dir        = "";
 
     // finetune
     struct lr_opt lr;
@@ -662,14 +690,15 @@ struct common_params {
     // server params
     int32_t port                = 8080;          // server listens on this network port
     bool    reuse_port          = false;         // allow multiple sockets to bind to the same port
-    int32_t timeout_read        = 600;           // http read timeout in seconds
+    int32_t timeout_read        = 3600;          // http read timeout in seconds
     int32_t timeout_write       = timeout_read;  // http write timeout in seconds
+    int32_t sse_ping_interval   = 30;            // SSE ping interval in seconds
     int32_t n_threads_http      = -1;    // number of threads to process HTTP requests (TODO: support threadpool)
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
-    int32_t checkpoint_every_nt = 8192;  // make a checkpoint every n tokens during prefill
+    int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
     std::string hostname      = "127.0.0.1";
@@ -677,10 +706,19 @@ struct common_params {
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
     bool use_jinja = true;                                                                                  // NOLINT
+
+    // server CORS params
+    std::string cors_origins = "*";
+    std::string cors_methods = "GET, POST, DELETE, OPTIONS";
+    std::string cors_headers = "*";
+    bool cors_credentials = true;
+    bool cors_origins_explicit = false; // for --agent option
+
     bool enable_chat_template = true;
     bool force_pure_content_parser = false;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
+    common_reasoning_loop_guard_params reasoning_loop_guard;
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 
@@ -691,10 +729,13 @@ struct common_params {
 
     std::map<std::string, std::string> default_template_kwargs;
 
-    // webui configs
-    bool webui = true;
-    bool webui_mcp_proxy = false;
-    std::string webui_config_json;
+    // CLI params
+    std::string server_base; // if set, connect to this server instead of starting a new one
+
+    // UI configs
+    bool ui = true;
+    bool ui_mcp_proxy = false;
+    std::string ui_config_json;
 
     // "advanced" endpoints are disabled by default for better security
     bool endpoint_slots   = true;
@@ -703,12 +744,18 @@ struct common_params {
 
     // enable built-in tools
     std::vector<std::string> server_tools;
+    std::string server_tools_runtime;
+
+    // MCP server configs (Cursor-compatible JSON)
+    std::string mcp_servers_config;   // path to JSON file with MCP server definitions
+    std::string mcp_servers_json;     // inline JSON with MCP server definitions
 
     // router server configs
-    std::string models_dir    = ""; // directory containing models for the router server
-    std::string models_preset = ""; // directory containing model presets for the router server
-    int models_max = 4;             // maximum number of models to load simultaneously
-    bool models_autoload = true;    // automatically load models when requested via the router server
+    std::string models_dir    = "";     // directory containing models for the router server
+    std::string models_preset = "";     // directory containing model presets for the router server
+    int models_max = 4;                 // maximum number of models to load simultaneously
+    bool models_autoload = true;        // automatically load models when requested via the router server
+    std::string models_preset_hf = "";  // show a warning about remote presets on router loaded (if not empty)
 
     bool log_json = false;
 
@@ -724,6 +771,8 @@ struct common_params {
     std::vector<int32_t> n_pp;
     std::vector<int32_t> n_tg;
     std::vector<int32_t> n_pl;
+    std::string batched_bench_batch_layout = "seq-major";
+    std::string batched_bench_logits_out;
 
     // retrieval params
     std::vector<std::string> context_files; // context files to embed
@@ -759,6 +808,12 @@ struct common_params {
     // batched-bench params
     bool batched_bench_output_jsonl = false;
 
+    // tokenize params
+    bool tokenize_ids        = false; // if true, only print the token IDs
+    bool tokenize_stdin      = false; // if true, read the prompt from stdin
+    bool tokenize_no_bos     = false; // if true, do not add the BOS token
+    bool tokenize_show_count = false; // if true, print the total token count
+
     // common params
     std::string out_file; // output filename for all example programs
     // optional callback for model loading progress and cancellation:
@@ -767,12 +822,19 @@ struct common_params {
     llama_progress_callback load_progress_callback = NULL;
     void *                  load_progress_callback_user_data = NULL;
     bool no_alloc = false; // Don't allocate model buffers
+
+    // TTS params
+    std::string tts_lang = "";
+    std::string tts_speaker_file = "";
+
+    bool is_gen_docs = false; // whether we are running inside llama-gen-docs
 };
 
 // call once at the start of a program if it uses libcommon
 // initializes the logging system and prints info about the build
 void common_init();
 
+void common_params_print_info(const common_params & params, bool print_devices = true);
 std::string common_params_get_system_info(const common_params & params);
 
 bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREADS]);
@@ -799,6 +861,7 @@ std::string string_format(const char * fmt, ...);
 
 std::string string_strip(const std::string & str);
 std::string string_get_sortable_timestamp();
+std::string string_lcs(std::string_view a, std::string_view b);
 
 std::string string_join(const std::vector<std::string> & values, const std::string & separator);
 std::vector<std::string> string_split(const std::string & str, const std::string & delimiter);
@@ -890,6 +953,15 @@ std::string string_from(const struct llama_context * ctx, const struct llama_bat
 bool glob_match(const std::string & pattern, const std::string & str);
 
 //
+// Environment utils
+//
+
+// portable environment access, an unset variable reads as an empty string
+// and setting an empty value unsets the variable
+std::string common_get_env(const std::string & name);
+void        common_set_env(const std::string & name, const std::string & value);
+
+//
 // Filesystem utils
 //
 
@@ -899,6 +971,7 @@ bool fs_is_directory(const std::string & path);
 
 std::string fs_get_cache_directory();
 std::string fs_get_cache_file(const std::string & filename);
+std::string fs_get_config_directory();
 
 struct common_file_info {
     std::string path;
@@ -907,6 +980,9 @@ struct common_file_info {
     bool        is_dir = false;
 };
 std::vector<common_file_info> fs_list(const std::string & path, bool include_directories);
+
+// fs open, also handle UTF8 on Windows
+std::ifstream fs_open_ifstream(const std::string & fname, std::ios_base::openmode mode);
 
 //
 // TTY utils
@@ -923,7 +999,7 @@ struct common_sampler;
 
 // note: defines the model, context, samplers, ets. lifetimes
 struct common_init_result {
-    common_init_result(common_params & params);
+    common_init_result(common_params & params, bool model_only = false);
     ~common_init_result();
 
     llama_model * model();
@@ -941,11 +1017,10 @@ private:
 
 using common_init_result_ptr = std::unique_ptr<common_init_result>;
 
-common_init_result_ptr common_init_from_params(common_params & params);
+common_init_result_ptr common_init_from_params(common_params & params, bool model_only = false);
 
-struct llama_model_params     common_model_params_to_llama  (      common_params & params);
-struct llama_context_params   common_context_params_to_llama(const common_params & params);
-struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
+struct llama_model_params   common_model_params_to_llama  (      common_params & params);
+struct llama_context_params common_context_params_to_llama(const common_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);
@@ -953,20 +1028,92 @@ void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adap
 // model endpoint from env
 std::string common_get_model_endpoint();
 
+// for testing purposes
+char * common_get_model_or_exit(int, char*[]);
+
+//
+// Threadpool utils
+//
+
+struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
+
+struct common_threadpools {
+    common_threadpools() = default;
+    ~common_threadpools();
+
+    common_threadpools(const common_threadpools &) = delete;
+    common_threadpools & operator=(const common_threadpools &) = delete;
+
+    void init(llama_context * ctx, const common_params & params);
+
+private:
+    ggml_threadpool * threadpool       = nullptr;
+    ggml_threadpool * threadpool_batch = nullptr;
+
+    decltype(ggml_threadpool_free) * free_fn = nullptr;
+};
+
 //
 // Context utils
 //
 
 enum common_context_seq_rm_type {
-    COMMON_CONTEXT_SEQ_RM_TYPE_NO   = 0, // seq_rm not supported (e.g. no memory module)
-    COMMON_CONTEXT_SEQ_RM_TYPE_PART = 1, // can seq_rm partial sequences
-    COMMON_CONTEXT_SEQ_RM_TYPE_FULL = 2, // can seq_rm full sequences only
+    COMMON_CONTEXT_SEQ_RM_TYPE_NO           = 0, // seq_rm not supported (e.g. no memory module)
+    COMMON_CONTEXT_SEQ_RM_TYPE_PART         = 1, // can seq_rm partial sequences
+    COMMON_CONTEXT_SEQ_RM_TYPE_FULL         = 2, // can seq_rm full sequences only
+    COMMON_CONTEXT_SEQ_RM_TYPE_RS = 3, // can seq_rm partial sequences, bounded by n_rs_seq
 };
 
-// check if the llama_context can remove sequences
-// note: clears the memory of the context
+// Read-only memory capability query for recurrent/speculative setup.
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx);
+uint32_t common_context_seq_rm_max_rollback(llama_context * ctx);
 
+enum common_memory_context_kind {
+    COMMON_MEMORY_CONTEXT_TARGET,
+    COMMON_MEMORY_CONTEXT_DRAFT,
+};
+
+enum common_memory_seq_rm_result {
+    COMMON_MEMORY_SEQ_RM_APPLIED,
+    COMMON_MEMORY_SEQ_RM_FULL_REPROCESS,
+    COMMON_MEMORY_SEQ_RM_MUTATION_FAILED,
+};
+
+// Injectable memory operations used by the transactional suffix-removal helper.
+// The concrete common_memory overload below supplies these from llama_context;
+// the explicit form keeps failure recovery independently testable.
+struct common_memory_seq_rm_io {
+    bool has_draft;
+    std::function<bool(common_memory_context_kind, llama_seq_id, llama_pos, llama_pos,
+                       llama_pos &, llama_pos &)> plan;
+    std::function<bool(common_memory_context_kind, llama_seq_id, llama_pos, llama_pos)> can_remove;
+    std::function<bool(common_memory_context_kind, llama_seq_id, llama_pos, llama_pos)> remove;
+};
+
+common_memory_seq_rm_result common_memory_seq_rm_suffix(
+        llama_seq_id seq_id,
+        llama_pos requested_p0,
+        const common_memory_seq_rm_io & io,
+        const std::function<llama_pos(llama_pos)> & normalize_p0,
+        llama_pos & planned_p0);
+
+struct common_memory {
+    llama_context * ctx_tgt = nullptr;
+    llama_context * ctx_dft = nullptr;
+
+    void init(llama_context * ctx_tgt, llama_context * ctx_dft = nullptr);
+
+    // aborts execution on failure
+    void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+    void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
+    void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
+
+    common_memory_seq_rm_result seq_rm_suffix(
+            llama_seq_id seq_id,
+            llama_pos requested_p0,
+            const std::function<llama_pos(llama_pos)> & normalize_p0,
+            llama_pos & planned_p0) const;
+};
 
 //
 // Batch utils
@@ -988,7 +1135,8 @@ void common_batch_add(
 // tokens from memory, so this approach works across all model architectures.
 bool common_prompt_batch_decode(
               struct llama_context * ctx,
-    const std::vector<llama_token> & embd,
+    const std::vector<llama_token> & all_tokens,
+                               int   n_new,
                                int & n_past,
                                int   n_batch,
                   std::string_view   state_path,
@@ -1084,17 +1232,28 @@ const char * const LLM_KV_SPLIT_TENSORS_COUNT = "split.tensors.count";
 }
 
 //
-// MoE utils
+// FFN offload utils
 //
 
 const char * const LLM_FFN_EXPS_REGEX = "\\.ffn_(up|down|gate|gate_up)_(ch|)exps";
 
-inline std::string llm_ffn_exps_block_regex(int idx) {
-    return string_format("blk\\.%d%s", idx, LLM_FFN_EXPS_REGEX);
+const char * const LLM_FFN_DENSE_REGEX = "\\.ffn_(up|down|gate)\\.";
+
+inline std::string llm_ffn_block_regex(int idx, const char * ffn_regex) {
+    return string_format("blk\\.%d%s", idx, ffn_regex);
 }
 
 inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
     return { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() };
+}
+
+inline void llm_add_n_cpu_ffn_overrides(int n, const char * ffn_regex, std::vector<llama_model_tensor_buft_override> & overrides) {
+    // keep strings alive and avoid leaking memory by storing them in a static list
+    static std::list<std::string> buft_override_strings;
+    for (int i = 0; i < n; ++i) {
+        buft_override_strings.push_back(llm_ffn_block_regex(i, ffn_regex));
+        overrides.push_back({buft_override_strings.back().c_str(), ggml_backend_cpu_buffer_type()});
+    }
 }
 
 //
@@ -1105,3 +1264,116 @@ ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std
 
 // "adamw" or "sgd" (case insensitive)
 enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
+
+//
+// prompt utils
+//
+
+enum common_prompt_checkpoint_status {
+    COMMON_PROMPT_CHECKPOINT_SUCCESS,
+    COMMON_PROMPT_CHECKPOINT_SKIPPED,
+    COMMON_PROMPT_CHECKPOINT_INVALID_CONTEXT,
+    COMMON_PROMPT_CHECKPOINT_UNSUPPORTED,
+    COMMON_PROMPT_CHECKPOINT_SIZE_MISMATCH,
+    COMMON_PROMPT_CHECKPOINT_ALLOCATION_FAILED,
+};
+
+struct common_prompt_checkpoint_result {
+    common_prompt_checkpoint_status status = COMMON_PROMPT_CHECKPOINT_SUCCESS;
+    size_t bytes = 0;
+
+    bool ok() const {
+        return status == COMMON_PROMPT_CHECKPOINT_SUCCESS ||
+                status == COMMON_PROMPT_CHECKPOINT_SKIPPED;
+    }
+};
+
+class common_prompt_checkpoint_buffer {
+public:
+    common_prompt_checkpoint_buffer() : storage(empty_storage()) {}
+
+    size_t size() const { return storage->size(); }
+    bool empty() const { return storage->empty(); }
+    const uint8_t * data() const { return storage->data(); }
+    const void * storage_id() const { return storage.get(); }
+
+    uint8_t * data() {
+        detach();
+        return storage->data();
+    }
+    void resize(size_t size) {
+        detach();
+        storage->resize(size);
+    }
+    void resize(size_t size, uint8_t value) {
+        detach();
+        storage->resize(size, value);
+    }
+    void clear() {
+        storage = empty_storage();
+    }
+
+private:
+    static const std::shared_ptr<std::vector<uint8_t>> & empty_storage() {
+        static const auto empty = std::make_shared<std::vector<uint8_t>>();
+        return empty;
+    }
+
+    void detach() {
+        if (!storage.unique()) {
+            storage = std::make_shared<std::vector<uint8_t>>(*storage);
+        }
+    }
+
+    std::shared_ptr<std::vector<uint8_t>> storage;
+};
+
+struct common_prompt_checkpoint {
+    int64_t n_tokens;
+
+    // (optional) id of the task that created the checkpoint
+    int id_task = -1;
+
+    llama_pos pos_min;
+    llama_pos pos_max;
+
+    common_prompt_checkpoint_buffer data_tgt;
+    common_prompt_checkpoint_buffer data_dft;
+
+    // (optional) speculative-decoding implementation state stashed with the checkpoint
+    // (e.g. eagle3's deferred-boundary g_embd row)
+    std::vector<uint8_t> data_spec;
+
+    size_t size() const;
+
+    bool empty() const;
+    void clear();
+
+    void update_pos(
+            int64_t n_tokens,
+            llama_pos pos_min,
+            llama_pos pos_max);
+
+    common_prompt_checkpoint_result update_tgt(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags);
+
+    common_prompt_checkpoint_result update_dft(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags);
+
+    common_prompt_checkpoint_result load_tgt(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+
+    common_prompt_checkpoint_result load_dft(
+            llama_context * ctx,
+            llama_seq_id seq_id,
+            llama_state_seq_flags flags) const;
+
+    void clear_tgt();
+    void clear_dft();
+};

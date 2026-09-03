@@ -6,6 +6,7 @@
 #include "reasoning-budget.h"
 
 #include <cstddef>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -36,17 +37,30 @@
 
 struct common_sampler;
 
+struct common_sampler_accept_info {
+    llama_token token = LLAMA_TOKEN_NULL;
+    bool is_generated = false;
+    common_reasoning_budget_state reasoning_state_before = REASONING_BUDGET_IDLE;
+    common_reasoning_budget_state reasoning_state_after  = REASONING_BUDGET_IDLE;
+};
+
+using common_sampler_accept_callback = std::function<bool(const common_sampler_accept_info &)>;
+
 // llama_sampler API overloads
 
 // note: can mutate params in some cases
-struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params);
+struct common_sampler * common_sampler_init(
+        const struct llama_model * model,
+        struct common_params_sampling & params);
 
 void common_sampler_free(struct common_sampler * gsmpl);
 
 // if is_generated is true, the token is accepted by the sampling chain, the reasoning budget sampler, and the grammar sampler
 void                    common_sampler_accept(struct common_sampler * gsmpl, llama_token token, bool is_generated);
+common_sampler_accept_info common_sampler_accept_with_info(struct common_sampler * gsmpl, llama_token token, bool is_generated);
 void                    common_sampler_reset (struct common_sampler * gsmpl);
 struct common_sampler * common_sampler_clone (struct common_sampler * gsmpl);
+void                    common_sampler_copy  (const struct common_sampler * src, struct common_sampler * dst);
 
 // arguments can be nullptr to skip printing
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl);
@@ -66,9 +80,6 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl);
 //
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first = false);
 
-bool common_sampler_supports_reduced(struct common_sampler * gsmpl);
-bool common_sampler_blocks_speculative(const struct common_sampler * gsmpl);
-
 // generalized version of common_sampler_sample
 //
 // will cross-reference the sampled tokens with a batch of draft tokens and accept those that match
@@ -85,24 +96,26 @@ bool common_sampler_blocks_speculative(const struct common_sampler * gsmpl);
 //
 // returns at least 1 token, up to idxs.size()
 //
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
-
-// DFlash verifier fast path: run the existing sampler chain over compact per-row
-// candidate lists instead of full-vocab logits. `candidate_ids` and
-// `candidate_logits` are row-major [n_rows][k]; logits may be logit-equivalent
-// values shifted by a row constant.
-std::vector<llama_token> common_sampler_sample_reduced_and_accept_n(
+std::vector<llama_token> common_sampler_sample_and_accept_n(
         struct common_sampler * gsmpl,
-        const llama_token     * candidate_ids,
-        const float           * candidate_logits,
-        int32_t                 n_rows,
-        int32_t                 k,
-        const llama_tokens    & draft);
+        struct llama_context  * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens    & draft,
+        bool                    grammar_first = false,
+        const common_sampler_accept_callback & on_accept = {});
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context  * ctx,
+        const llama_tokens    & draft,
+        bool                    grammar_first = false,
+        const common_sampler_accept_callback & on_accept = {});
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
+
+// force the reasoning budget sampler (if any) to begin forcing its end sequence now.
+bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 
 // helpers
 
@@ -120,16 +133,12 @@ std::string common_sampler_print(const struct common_sampler * gsmpl);
 // get a string representation of the last accepted tokens
 std::string common_sampler_prev_str(common_sampler * gsmpl, llama_context * ctx, int n);
 
-common_reasoning_budget_state common_sampler_get_reasoning_budget_state(const struct common_sampler * gsmpl);
-
 bool common_sampler_force_reasoning_end(struct common_sampler * gsmpl);
-
-size_t common_sampler_reasoning_forced_token_count(const struct common_sampler * gsmpl);
 
 char        common_sampler_type_to_chr(enum common_sampler_type cnstr);
 std::string common_sampler_type_to_str(enum common_sampler_type cnstr);
 
-std::vector<enum common_sampler_type> common_sampler_types_from_names(const std::vector<std::string> & names, bool allow_alt_names);
+std::vector<enum common_sampler_type> common_sampler_types_from_names(const std::vector<std::string> & names);
 std::vector<enum common_sampler_type> common_sampler_types_from_chars(const std::string & chars);
 
 llama_sampler * llama_sampler_init_llg(const llama_vocab * vocab,

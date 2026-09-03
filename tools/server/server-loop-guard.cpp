@@ -11,6 +11,11 @@ server_loop_guard::server_loop_guard(common_reasoning_loop_guard_params params)
     : params(params) {
 }
 
+void server_loop_guard::configure(common_reasoning_loop_guard_params params) {
+    this->params = params;
+    reset();
+}
+
 void server_loop_guard::reset() {
     reasoning_tail.clear();
     visible_tail.clear();

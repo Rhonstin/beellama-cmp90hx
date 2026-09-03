@@ -1,11 +1,41 @@
-# Install pre-built version of llama.cpp
+# Install pre-built binaries
 
-| Install via | Windows | Mac | Linux |
-|-------------|---------|-----|-------|
+BeeLlama release binaries are published on the project's [releases page](https://github.com/Anbeeld/beellama.cpp/releases). The package-manager commands below install upstream `llama.cpp`, not BeeLlama, so they are not guaranteed to include Bee-specific features such as KVarN or adaptive DFlash control.
+
+| Install via | Windows | Mac  | Linux |
+|-------------|---------|------|-------|
+| conda-forge | ✅      | ✅   | ✅   |
 | Winget      | ✅      |      |      |
 | Homebrew    |         | ✅   | ✅   |
 | MacPorts    |         | ✅   |      |
 | Nix         |         | ✅   | ✅   |
+
+## conda-forge (Windows, Mac and Linux)
+
+conda-forge provides builds for:
+ - CUDA (Windows and Linux)
+ - Vulkan (Windows and Linux)
+ - Apple Metal (macOS)
+
+```sh
+conda install -c conda-forge llama.cpp
+```
+
+```sh
+mamba install -c conda-forge llama.cpp
+```
+
+```sh
+# Project-local installation
+pixi add llama.cpp
+
+# Global installation
+pixi global install llama.cpp
+```
+
+This distribution is managed on [`conda-forge/llama.cpp-feedstock`](https://github.com/conda-forge/llama.cpp-feedstock/).
+
+Shall you have any problems, please open an issue on [its issue tracker](https://github.com/conda-forge/llama.cpp-feedstock/issues).
 
 ## Winget (Windows)
 

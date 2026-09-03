@@ -41,7 +41,8 @@ configure_file(${TEMPLATE_FILE} ${OUTPUT_FILE})
 set(TARGET llama-common-base)
 add_library(${TARGET} STATIC ${OUTPUT_FILE})
 
-target_include_directories(${TARGET} PUBLIC .)
+target_include_directories(${TARGET} PUBLIC . ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/include)
+target_compile_features   (${TARGET} PRIVATE cxx_std_17)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -75,12 +76,16 @@ add_library(${TARGET}
     download.h
     fit.cpp
     fit.h
+    fit-kvarn-tail.cpp
+    fit-kvarn-tail.h
     hf-cache.cpp
     hf-cache.h
     http.h
-    json-partial.cpp
-    json-partial.h
+    imatrix-loader.cpp
+    imatrix-loader.h
     json-schema-to-grammar.cpp
+    json.cpp
+    json.h
     llguidance.cpp
     log.cpp
     log.h
@@ -94,17 +99,16 @@ add_library(${TARGET}
     peg-parser.h
     preset.cpp
     preset.h
-    regex-partial.cpp
     reasoning-budget.cpp
     reasoning-budget.h
-    regex-partial.h
     sampling.cpp
     sampling.h
     speculative.cpp
     speculative.h
-    suffix-tree.cpp
-    suffix-tree.h
-    int32-map.h
+    subproc.cpp
+    subproc.h
+    trie.cpp
+    trie.h
     unicode.cpp
     unicode.h
     jinja/lexer.cpp
@@ -122,13 +126,18 @@ add_library(${TARGET}
     )
 
 set_target_properties(${TARGET} PROPERTIES
-    VERSION ${LLAMA_INSTALL_VERSION}
-    SOVERSION 0
+    VERSION ${LLAMA_VERSION_BASE}
+    SOVERSION ${LLAMA_VERSION_MAJOR}
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 
-target_include_directories(${TARGET} PUBLIC . ../vendor)
+target_include_directories(${TARGET} PUBLIC .)
+target_link_libraries     (${TARGET} PUBLIC vendor::nlohmann vendor::sheredom)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
+
+if (LLAMA_SUBPROCESS)
+    target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)

@@ -20,10 +20,26 @@ struct server_loop_guard_result {
     float score = 0.0f;
 };
 
+struct server_loop_guard_telemetry {
+    bool triggered = false;
+    std::string region;
+    std::string detector;
+    int32_t period = 0;
+    int32_t coverage = 0;
+    float score = 0.0f;
+    int32_t interventions = 0;
+    std::string action;
+    int32_t decoded_token_index = 0;
+    llama_token token = LLAMA_TOKEN_NULL;
+    std::string token_piece;
+    std::string reason;
+};
+
 class server_loop_guard {
 public:
     explicit server_loop_guard(common_reasoning_loop_guard_params params = {});
 
+    void configure(common_reasoning_loop_guard_params params);
     void reset();
     void accept(llama_token token, server_loop_guard_region region);
     bool should_check(server_loop_guard_region region, bool token_is_eog, bool forcing_reasoning_end) const;

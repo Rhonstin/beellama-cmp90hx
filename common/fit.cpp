@@ -1,14 +1,17 @@
 #include "fit.h"
+#include "fit-kvarn-tail.h"
 
 #include "log.h"
 
 #include "../src/llama-ext.h"
+#include "../src/llama-kv-tail-request.h"
 
 #include <array>
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
 #include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -26,7 +29,7 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-static std::vector<llama_device_memory_data> common_get_device_memory_data(
+static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
         const llama_context_params * cparams,
@@ -54,8 +57,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data(
 
     llama_model_params mparams_copy = *mparams;
     mparams_copy.no_alloc  = true;
-    mparams_copy.use_mmap  = false;
-    mparams_copy.use_mlock = false;
+    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
 
     llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
     if (model == nullptr) {
@@ -109,16 +111,24 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data(
         ret.back().total = total;
     }
     for (size_t i = 0; i < nd; i++) {
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+
         size_t free;
         size_t total;
-        ggml_backend_dev_memory(llama_model_get_device(model, i), &free, &total);
+        ggml_backend_dev_memory(dev, &free, &total);
 
-        // devices can return 0 bytes for free and total memory if they do not
-        // have any to report. in this case, we will use the host memory as a fallback
-        // fixes: https://github.com/ggml-org/llama.cpp/issues/18577
+        // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
+        // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit does
+        // not assign anything to a device with an unknown memory budget.
         if (free == 0 && total == 0) {
-            free  = ret.back().free;
-            total = ret.back().total;
+            const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
+            if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                LOG_WRN("%s: device %s did not report memory; --fit will not use it\n",
+                        __func__, ggml_backend_dev_name(dev));
+            } else {
+                free  = ret.back().free;
+                total = ret.back().total;
+            }
         }
         ret[i].free  = free;
         ret[i].total = total;
@@ -130,6 +140,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data(
     }
 
     hp_ngl         = llama_model_n_layer(model);
+    if (mparams->load_mtp) {
+        hp_ngl    += llama_model_n_layer_nextn(model);
+    }
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
 
@@ -142,10 +155,33 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data(
     return ret;
 }
 
+common_device_memory_data_vec common_get_device_memory_data(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        std::vector<ggml_backend_dev_t> & devs,
+        uint32_t & hp_ngl,
+        uint32_t & hp_n_ctx_train,
+        uint32_t & hp_n_expert,
+        ggml_log_level log_level) {
+    std::vector<llama_device_memory_data> impl = common_get_device_memory_data_impl(
+            path_model, mparams, cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, log_level);
+
+    common_device_memory_data_vec ret(impl.size());
+    for (size_t i = 0; i < impl.size(); i++) {
+        ret[i].total   = impl[i].total;
+        ret[i].free    = impl[i].free;
+        ret[i].model   = impl[i].mb.model;
+        ret[i].context = impl[i].mb.context;
+        ret[i].compute = impl[i].mb.compute;
+    }
+    return ret;
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, enum ggml_log_level log_level) {
+        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
@@ -158,10 +194,92 @@ static void common_params_fit_impl(
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
 
+    // with non-unified kv, we need to take into account n_streams
+    // for example, if memory can hold more than model's trained context size, we must extend the n_ctx to hold enough n_streams
+    const uint32_t n_streams  = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
+    const bool     n_ctx_auto = cparams->n_ctx == 0;
+
+    dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
+    uint32_t n_ctx_extra = 0;  // context that memory was measured at
+
+    // the extra model competes for the same memory as the main model, add it to every measurement
+    // its memory is measured again whenever the context it follows changes
+    auto add_extra_memory = [&](dmds_t & dmds) {
+        if (extra == nullptr) {
+            return;
+        }
+
+        if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx) {
+            std::vector<ggml_backend_dev_t> devs_extra;
+            uint32_t ngl_extra = 0;
+            uint32_t nct_extra = 0;
+            uint32_t nex_extra = 0;
+
+            extra->cparams->n_ctx = cparams->n_ctx;
+
+            LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 ":\n",
+                __func__, cparams->n_ctx);
+
+            dmds_t measured;
+            try {
+                measured = common_get_device_memory_data_impl(
+                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+            } catch (const std::runtime_error & e) {
+                // the extra model is optional, fit the main model alone rather than giving up
+                LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
+                dmds_extra = dmds_t(devs.size() + 1);
+                n_ctx_extra = cparams->n_ctx;
+                return;
+            }
+
+            dmds_extra = dmds_t(devs.size() + 1);
+            dmds_extra.back().mb = measured.back().mb;
+            for (size_t je = 0; je < devs_extra.size(); je++) {
+                for (size_t id = 0; id < devs.size(); id++) {
+                    if (devs_extra[je] == devs[id]) {
+                        dmds_extra[id].mb.model   += measured[je].mb.model;
+                        dmds_extra[id].mb.context += measured[je].mb.context;
+                        dmds_extra[id].mb.compute += measured[je].mb.compute;
+                        break;
+                    }
+                }
+            }
+            if (extra->shares_model) {
+                for (llama_device_memory_data & dmd : dmds_extra) {
+                    dmd.mb.model = 0;
+                }
+            }
+
+            n_ctx_extra = cparams->n_ctx;
+        }
+
+        for (size_t id = 0; id < dmds.size(); id++) {
+            dmds[id].mb.model   += dmds_extra[id].mb.model;
+            dmds[id].mb.context += dmds_extra[id].mb.context;
+            dmds[id].mb.compute += dmds_extra[id].mb.compute;
+        }
+    };
+
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
-    LOG_INF("%s: getting device memory data for initial parameters:\n", __func__);
-    const dmds_t dmds_full = common_get_device_memory_data(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
+    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+
+    // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
+    const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
+    const uint32_t n_ctx_min_total = (uint32_t) std::min<uint64_t>(uint64_t(n_ctx_min) * n_streams, UINT32_MAX);
+
+    // llama_context would use only hp_nct in total for n_ctx == 0, resolve the context before measuring anything else:
+    if (n_ctx_auto) {
+        cparams->n_ctx = n_ctx_max;
+        if (n_streams > 1) {
+            LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
+                __func__, n_ctx_max, n_streams);
+            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        }
+    }
+    add_extra_memory(dmds_full);
+
     const size_t nd = devs.size(); // number of devices
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
@@ -202,16 +320,16 @@ static void common_params_fit_impl(
         sum_projected_used = dmds_full.back().mb.total();
         sum_free           = dmds_full.back().total;
         sum_projected_free = sum_free - sum_projected_used;
-        LOG_INF("%s: projected to use %" PRId64 " MiB of host memory vs. %" PRId64 " MiB of total host memory\n",
+        LOG_TRC("%s: projected to use %" PRId64 " MiB of host memory vs. %" PRId64 " MiB of total host memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
         if (sum_projected_free >= margins[0]) {
-            LOG_INF("%s: will leave %" PRId64 " >= %" PRId64 " MiB of system memory, no changes needed\n",
+            LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of system memory, no changes needed\n",
                 __func__, sum_projected_free/MiB, margins[0]/MiB);
             return;
         }
     } else {
         if (nd > 1) {
-            LOG_INF("%s: projected memory use with initial parameters [MiB]:\n", __func__);
+            LOG_TRC("%s: projected memory use with initial parameters [MiB]:\n", __func__);
         }
         for (size_t id = 0; id < nd; id++) {
             const llama_device_memory_data & dmd = dmds_full[id];
@@ -226,16 +344,16 @@ static void common_params_fit_impl(
             sum_projected_model += dmd.mb.model;
 
             if (nd > 1) {
-                LOG_INF("%s:   - %s: %6" PRId64 " total, %6" PRId64 " used, %6" PRId64 " free vs. target of %6" PRId64 "\n",
+                LOG_TRC("%s:   - %s: %6" PRId64 " total, %6" PRId64 " used, %6" PRId64 " free vs. target of %6" PRId64 "\n",
                     __func__, dev_names[id].c_str(), dmd.total/MiB, projected_used/MiB, projected_free/MiB, margins[id]/MiB);
             }
         }
         assert(sum_free >= 0 && sum_projected_used >= 0);
-        LOG_INF("%s: projected to use %" PRId64 " MiB of device memory vs. %" PRId64 " MiB of free device memory\n",
+        LOG_TRC("%s: projected to use %" PRId64 " MiB of device memory vs. %" PRId64 " MiB of free device memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
         if (nd == 1) {
             if (projected_free_per_device[0] >= margins[0]) {
-                LOG_INF("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
+                LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
                     __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
                 return;
             }
@@ -248,7 +366,7 @@ static void common_params_fit_impl(
                 }
             }
             if (!changes_needed) {
-                LOG_INF("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
+                LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
                 return;
             }
         }
@@ -267,15 +385,15 @@ static void common_params_fit_impl(
         }
         if (global_surplus < 0) {
             if (nd <= 1) {
-                LOG_INF("%s: cannot meet free memory target of %" PRId64 " MiB, need to reduce device memory by %" PRId64 " MiB\n",
+                LOG_TRC("%s: cannot meet free memory target of %" PRId64 " MiB, need to reduce device memory by %" PRId64 " MiB\n",
                     __func__, margins[0]/MiB, -global_surplus/MiB);
             } else {
-                LOG_INF(
+                LOG_TRC(
                     "%s: cannot meet free memory targets on all devices, need to use %" PRId64 " MiB less in total\n",
                     __func__, -global_surplus/MiB);
             }
-            if (cparams->n_ctx == 0) {
-                if (hp_nct > n_ctx_min) {
+            if (n_ctx_auto) {
+                if (n_ctx_max > n_ctx_min_total) {
                     int64_t sum_used_target = sum_free;
                     if (nd == 0) {
                         sum_used_target -= margins[0];
@@ -295,8 +413,9 @@ static void common_params_fit_impl(
                     }
 
                     int64_t sum_projected_used_min_ctx = 0;
-                    cparams->n_ctx = n_ctx_min;
-                    const dmds_t dmds_min_ctx = common_get_device_memory_data(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                    cparams->n_ctx = n_ctx_min_total;
+                    dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+                    add_extra_memory(dmds_min_ctx);
                     if (nd == 0) {
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
                     } else {
@@ -306,34 +425,36 @@ static void common_params_fit_impl(
                     }
                     if (sum_used_target > sum_projected_used_min_ctx) {
                         // linear interpolation between minimum and maximum context size:
-                        cparams->n_ctx += (hp_nct - n_ctx_min) * (sum_used_target - sum_projected_used_min_ctx)
+                        cparams->n_ctx += (n_ctx_max - n_ctx_min_total) * (sum_used_target - sum_projected_used_min_ctx)
                             / (sum_projected_used - sum_projected_used_min_ctx);
-                        cparams->n_ctx = std::max(cparams->n_ctx - cparams->n_ctx % 256, n_ctx_min); // round down context for CUDA backend
+                        // round down context for CUDA backend, keep it divisible by the number of streams:
+                        const uint32_t align = 256 * n_streams;
+                        cparams->n_ctx = std::max(cparams->n_ctx - cparams->n_ctx % align, n_ctx_min_total);
 
-                        const int64_t bytes_per_ctx = (sum_projected_used - sum_projected_used_min_ctx) / (hp_nct - n_ctx_min);
-                        const int64_t memory_reduction = (hp_nct - cparams->n_ctx) * bytes_per_ctx;
-                        LOG_INF("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
-                            __func__, hp_nct, cparams->n_ctx, memory_reduction/MiB);
+                        const int64_t bytes_per_ctx = (sum_projected_used - sum_projected_used_min_ctx) / (n_ctx_max - n_ctx_min_total);
+                        const int64_t memory_reduction = (n_ctx_max - cparams->n_ctx) * bytes_per_ctx;
+                        LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
+                            __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
                         if (nd <= 1) {
-                            LOG_INF("%s: entire model can be fit by reducing context\n", __func__);
+                            LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
                             return;
                         }
-                        LOG_INF("%s: entire model should be fit across devices by reducing context\n", __func__);
+                        LOG_TRC("%s: entire model should be fit across devices by reducing context\n", __func__);
                     } else {
                         const int64_t memory_reduction = sum_projected_used - sum_projected_used_min_ctx;
-                        LOG_INF("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
-                            __func__, hp_nct, cparams->n_ctx, memory_reduction/MiB);
+                        LOG_TRC("%s: context size reduced from %" PRIu32 " to %" PRIu32 " -> need %" PRId64 " MiB less memory in total\n",
+                            __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
                     }
                 } else {
                     if (n_ctx_min == UINT32_MAX) {
-                        LOG_INF("%s: user has requested full context size of %" PRIu32 " -> no change\n", __func__, hp_nct);
+                        LOG_TRC("%s: user has requested full context size of %" PRIu32 " -> no change\n", __func__, n_ctx_max);
                     } else {
-                        LOG_INF("%s: default model context size is %" PRIu32 " which is <= the min. context size of %" PRIu32 " -> no change\n",
-                            __func__, hp_nct, n_ctx_min);
+                        LOG_TRC("%s: default model context size is %" PRIu32 " which is <= the min. context size of %" PRIu32 " -> no change\n",
+                            __func__, n_ctx_max, n_ctx_min_total);
                     }
                 }
             } else {
-                LOG_INF("%s: context size set by user to %" PRIu32 " -> no change\n", __func__, cparams->n_ctx);
+                LOG_TRC("%s: context size set by user to %" PRIu32 " -> no change\n", __func__, cparams->n_ctx);
             }
         }
     }
@@ -474,13 +595,14 @@ static void common_params_fit_impl(
         llama_model_params mparams_copy = *mparams;
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
-        const dmds_t dmd_nl = common_get_device_memory_data(
+        dmds_t dmd_nl = common_get_device_memory_data_impl(
             path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        add_extra_memory(dmd_nl);
 
-        LOG_INF("%s: memory for test allocation by device:\n", func_name);
+        LOG_TRC("%s: memory for test allocation by device:\n", func_name);
         for (size_t id = 0; id < nd; id++) {
             const ngl_t & n = ngl_per_device[id];
-            LOG_INF(
+            LOG_TRC(
                 "%s: id=%zu, n_layer=%2" PRIu32 ", n_part=%2" PRIu32 ", overflow_type=%d, mem=%6" PRId64 " MiB\n",
                 func_name, id, n.n_layer, n.n_part, int(n.overflow_type), dmd_nl[id].mb.total()/MiB);
         }
@@ -501,9 +623,10 @@ static void common_params_fit_impl(
         tensor_buft_overrides[1] = {nullptr, nullptr};
         mparams->tensor_buft_overrides = tensor_buft_overrides;
 
-        LOG_INF("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
-        const dmds_t dmds_cpu_moe = common_get_device_memory_data(
+        LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
+        dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+        add_extra_memory(dmds_cpu_moe);
 
         for (size_t id = 0; id < nd; id++) {
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;
@@ -511,10 +634,10 @@ static void common_params_fit_impl(
         }
 
         if (global_surplus_cpu_moe > 0) {
-            LOG_INF("%s: with only dense weights in device memory there is a total surplus of %" PRId64 " MiB\n",
+            LOG_TRC("%s: with only dense weights in device memory there is a total surplus of %" PRId64 " MiB\n",
                 __func__, global_surplus_cpu_moe/MiB);
         } else {
-            LOG_INF("%s: with only dense weights in device memory there is still a total deficit of %" PRId64 " MiB\n",
+            LOG_TRC("%s: with only dense weights in device memory there is still a total deficit of %" PRId64 " MiB\n",
                 __func__, -global_surplus_cpu_moe/MiB);
         }
 
@@ -527,7 +650,7 @@ static void common_params_fit_impl(
     targets.reserve(nd);
     for (size_t id = 0; id < nd; id++) {
         targets.push_back(dmds_full[id].free - margins[id]);
-        LOG_INF("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
+        LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
     }
 
     std::vector<ggml_backend_buffer_type_t> overflow_bufts; // which bufts the first partial layer of a device overflows to:
@@ -547,9 +670,9 @@ static void common_params_fit_impl(
     //   - once we only have a difference of a single layer, stop and return the lower bound that just barely still fits
     //   - the last device has the output layer, which cannot be a partial layer
     if (hp_nex == 0) {
-        LOG_INF("%s: filling dense layers back-to-front:\n", __func__);
+        LOG_TRC("%s: filling dense layers back-to-front:\n", __func__);
     } else {
-        LOG_INF("%s: filling dense-only layers back-to-front:\n", __func__);
+        LOG_TRC("%s: filling dense-only layers back-to-front:\n", __func__);
     }
     for (int id = nd - 1; id >= 0; id--) {
         uint32_t n_unassigned = hp_ngl + 1;
@@ -568,7 +691,7 @@ static void common_params_fit_impl(
             if (mem_high[id] > targets[id]) {
                 assert(ngl_per_device_high[id].n_layer > ngl_per_device[id].n_layer);
                 uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
-                LOG_INF("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
+                LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
                 while (delta > 1) {
                     uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
                     step_size = std::max(step_size, uint32_t(1));
@@ -585,11 +708,11 @@ static void common_params_fit_impl(
                     if (mem_test[id] <= targets[id]) {
                         ngl_per_device = ngl_per_device_test;
                         mem            = mem_test;
-                        LOG_INF("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
+                        LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
                     } else {
                         ngl_per_device_high = ngl_per_device_test;
                         mem_high            = mem_test;
-                        LOG_INF("%s: set ngl_per_device_high[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device_high[id].n_layer);
+                        LOG_TRC("%s: set ngl_per_device_high[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device_high[id].n_layer);
                     }
                     delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                 }
@@ -597,12 +720,12 @@ static void common_params_fit_impl(
                 assert(ngl_per_device_high[id].n_layer == n_unassigned);
                 ngl_per_device = ngl_per_device_high;
                 mem            = mem_high;
-                LOG_INF("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
+                LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
             }
         }
 
         const int64_t projected_margin = dmds_full[id].free - mem[id];
-        LOG_INF(
+        LOG_TRC(
             "%s:   - %s: %2" PRIu32 " layers, %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
@@ -626,7 +749,7 @@ static void common_params_fit_impl(
     }
     assert(id_dense_start < nd);
 
-    LOG_INF("%s: converting dense-only layers to full layers and filling them front-to-back with overflow to next device/system memory:\n", __func__);
+    LOG_TRC("%s: converting dense-only layers to full layers and filling them front-to-back with overflow to next device/system memory:\n", __func__);
     for (size_t id = 0; id <= id_dense_start && id_dense_start < nd; id++) {
         std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
         for (size_t jd = id_dense_start; jd < nd; jd++) {
@@ -666,13 +789,13 @@ static void common_params_fit_impl(
                     ngl_per_device = ngl_per_device_test;
                     mem            = mem_test;
                     id_dense_start = id_dense_start_test;
-                    LOG_INF("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start=%zu\n",
+                    LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start=%zu\n",
                         __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
                 } else {
                     ngl_per_device_high = ngl_per_device_test;
                     mem_high            = mem_test;
                     id_dense_start_high = id_dense_start_test;
-                    LOG_INF("%s: set ngl_per_device_high[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start_high=%zu\n",
+                    LOG_TRC("%s: set ngl_per_device_high[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start_high=%zu\n",
                         __func__, id, ngl_per_device_high[id].n_layer, ngl_per_device_high[id].n_part, id_dense_start_high);
                 }
                 assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
@@ -682,7 +805,7 @@ static void common_params_fit_impl(
             ngl_per_device = ngl_per_device_high;
             mem            = mem_high;
             id_dense_start = id_dense_start_high;
-            LOG_INF("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start=%zu\n",
+            LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start=%zu\n",
                 __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
         }
 
@@ -702,44 +825,44 @@ static void common_params_fit_impl(
             if (id < nd - 1) {
                 overflow_bufts_test[id] = ggml_backend_dev_buffer_type(devs[id + 1]);
             }
-            LOG_INF("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_UP\n", __func__);
+            LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_UP\n", __func__);
             std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
             if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
                 ngl_per_device = ngl_per_device_test;
                 overflow_bufts = overflow_bufts_test;
                 mem            = mem_test;
                 id_dense_start = id_dense_start_test;
-                LOG_INF("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", UP), id_dense_start=%zu\n",
+                LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", UP), id_dense_start=%zu\n",
                     __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
 
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_GATE;
-                LOG_INF("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_GATE\n", __func__);
+                LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_GATE\n", __func__);
                 mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
                 if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
                     mem            = mem_test;
                     id_dense_start = id_dense_start_test;
-                    LOG_INF("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", GATE), id_dense_start=%zu\n",
+                    LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", GATE), id_dense_start=%zu\n",
                         __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
                 }
             } else {
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_ATTN;
-                LOG_INF("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_ATTN\n", __func__);
+                LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_ATTN\n", __func__);
                 mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
                 if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
                     mem            = mem_test;
                     id_dense_start = id_dense_start_test;
-                    LOG_INF("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", ATTN), id_dense_start=%zu\n",
+                    LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", ATTN), id_dense_start=%zu\n",
                         __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
                 }
             }
         }
 
         const int64_t projected_margin = dmds_full[id].free - mem[id];
-        LOG_INF(
+        LOG_TRC(
             "%s:   - %s: %2" PRIu32 " layers (%2" PRIu32 " overflowing), %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
     }
@@ -747,12 +870,64 @@ static void common_params_fit_impl(
     // print info for devices that were not changed during the conversion from dense only to full layers:
     for (size_t id = id_dense_start + 1; id < nd; id++) {
         const int64_t projected_margin = dmds_full[id].free - mem[id];
-        LOG_INF(
+        LOG_TRC(
             "%s:   - %s: %2" PRIu32 " layers (%2" PRIu32 " overflowing), %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
     }
 
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+}
+
+static std::string common_bee_fit_candidate_identity(
+        const llama_model_params & mparams,
+        const llama_context_params & cparams,
+        const float * tensor_split,
+        const llama_model_tensor_buft_override * tensor_buft_overrides,
+        const std::vector<llama_device_memory_data> & measured) {
+    std::ostringstream out;
+    out << "ctx=" << cparams.n_ctx << ";ngl=" << mparams.n_gpu_layers
+        << ";split=" << int(mparams.split_mode) << ";main=" << mparams.main_gpu
+        << ";ts=";
+    for (size_t i = 0; i < llama_max_devices(); ++i) {
+        out << tensor_split[i] << ',';
+    }
+    out << ";tbo=";
+    for (size_t i = 0; i < llama_max_tensor_buft_overrides(); ++i) {
+        const auto & buft_override = tensor_buft_overrides[i];
+        if (buft_override.pattern == nullptr) {
+            break;
+        }
+        out << buft_override.pattern << '=' << ggml_backend_buft_name(buft_override.buft) << ',';
+    }
+    const llama_kv_tail_request * request = cparams.kv_tail_request;
+    if (request) {
+        out << ";tail=" << int(request->mode) << ':' << int(request->exact_type) << ':';
+        for (const auto & entry : request->entries) {
+            out << entry.group << '=' << entry.tokens << ',';
+        }
+    }
+    out << ";measured=";
+    for (const auto & device : measured) {
+        out << device.mb.model << ':' << device.mb.context << ':' << device.mb.compute << ',';
+    }
+    return out.str();
+}
+
+static void common_bee_fit_restore_inputs(
+        llama_model_params * mparams,
+        llama_context_params * cparams,
+        float * tensor_split,
+        llama_model_tensor_buft_override * tensor_buft_overrides,
+        const llama_model_params & pristine_mparams,
+        const llama_context_params & pristine_cparams,
+        const std::vector<float> & pristine_tensor_split,
+        const std::vector<llama_model_tensor_buft_override> & pristine_overrides) {
+    *mparams = pristine_mparams;
+    *cparams = pristine_cparams;
+    std::copy(pristine_tensor_split.begin(), pristine_tensor_split.end(), tensor_split);
+    std::copy(pristine_overrides.begin(), pristine_overrides.end(), tensor_buft_overrides);
+    mparams->tensor_split = tensor_split;
+    mparams->tensor_buft_overrides = tensor_buft_overrides;
 }
 
 enum common_params_fit_status common_fit_params(
@@ -763,12 +938,116 @@ enum common_params_fit_status common_fit_params(
         llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins,
         uint32_t n_ctx_min,
+        const common_fit_extra_model * extra,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, log_level);
-        LOG_INF("%s: successfully fit params to free device memory\n", __func__);
+        // Preserve the upstream path exactly when no immutable Bee request is
+        // attached. Only KVarN/precision-tail callers pay for exact validation.
+        if (cparams->kv_tail_request == nullptr) {
+            common_params_fit_impl(path_model, mparams, cparams, tensor_split,
+                    tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+        } else {
+            const llama_model_params pristine_mparams = *mparams;
+            const llama_context_params pristine_cparams = *cparams;
+            const std::vector<float> pristine_tensor_split(
+                    tensor_split, tensor_split + llama_max_devices());
+            const std::vector<llama_model_tensor_buft_override> pristine_overrides(
+                    tensor_buft_overrides,
+                    tensor_buft_overrides + llama_max_tensor_buft_overrides());
+            const std::vector<size_t> pristine_margins(
+                    margins, margins + llama_max_devices());
+            std::vector<size_t> adjusted_margins = pristine_margins;
+            std::vector<int64_t> original_free;
+            common_bee_fit_retry_state retry_state;
+
+            {
+                std::vector<ggml_backend_dev_t> target_devs;
+                uint32_t target_ngl = 0;
+                uint32_t target_nct = 0;
+                uint32_t target_nex = 0;
+                const auto target_snapshot = common_get_device_memory_data_impl(
+                        path_model, &pristine_mparams, &pristine_cparams,
+                        target_devs, target_ngl, target_nct, target_nex, log_level);
+                if (target_snapshot.empty()) {
+                    throw std::runtime_error("Bee fit target snapshot returned no memory data");
+                }
+                const size_t nd = target_snapshot.size() - 1;
+                if (nd > llama_max_devices()) {
+                    throw std::runtime_error("Bee fit target snapshot returned too many devices");
+                }
+                original_free.reserve(nd);
+                for (size_t i = 0; i < nd; ++i) {
+                    original_free.push_back(target_snapshot[i].free);
+                }
+            }
+
+            for (;;) {
+                common_bee_fit_restore_inputs(mparams, cparams, tensor_split,
+                        tensor_buft_overrides, pristine_mparams, pristine_cparams,
+                        pristine_tensor_split, pristine_overrides);
+                common_params_fit_impl(path_model, mparams, cparams, tensor_split,
+                        tensor_buft_overrides, adjusted_margins.data(), n_ctx_min, extra, log_level);
+
+                std::vector<ggml_backend_dev_t> devs;
+                uint32_t hp_ngl = 0;
+                uint32_t hp_nct = 0;
+                uint32_t hp_nex = 0;
+                const auto exact = common_get_device_memory_data_impl(
+                        path_model, mparams, cparams, devs,
+                        hp_ngl, hp_nct, hp_nex, log_level);
+                if (exact.empty()) {
+                    throw std::runtime_error("Bee exact fit validation returned no memory data");
+                }
+                const size_t nd = exact.size() - 1;
+                if (nd > llama_max_devices()) {
+                    throw std::runtime_error("Bee exact fit validation returned too many devices");
+                }
+                if (original_free.size() != nd) {
+                    throw std::runtime_error("Bee exact fit validation device set changed during retry");
+                }
+
+                std::vector<int64_t> shortfalls(llama_max_devices(), 0);
+                for (size_t i = 0; i < nd; ++i) {
+                    const uint64_t projected = uint64_t(exact[i].mb.total()) +
+                            uint64_t(pristine_margins[i]);
+                    const uint64_t available = original_free[i] > 0 ?
+                            uint64_t(original_free[i]) : 0;
+                    if (projected > available) {
+                        const uint64_t shortfall = projected - available;
+                        shortfalls[i] = shortfall > uint64_t(INT64_MAX) ?
+                                INT64_MAX : int64_t(shortfall);
+                        LOG_WRN("%s: exact Bee validation shortfall on %s is %.2f MiB "
+                                "(model %.2f, context %.2f, compute %.2f MiB)\n",
+                                __func__, ggml_backend_dev_name(devs[i]),
+                                shortfalls[i] / 1024.0 / 1024.0,
+                                exact[i].mb.model / 1024.0 / 1024.0,
+                                exact[i].mb.context / 1024.0 / 1024.0,
+                                exact[i].mb.compute / 1024.0 / 1024.0);
+                    }
+                }
+                const std::string identity = common_bee_fit_candidate_identity(
+                        *mparams, *cparams, tensor_split, tensor_buft_overrides, exact);
+                const auto action = retry_state.observe(
+                        identity, shortfalls, adjusted_margins);
+                if (action == COMMON_BEE_FIT_ACCEPT) {
+                    LOG_TRC("%s: exact Bee post-fit validation passed\n", __func__);
+                    break;
+                }
+                if (action == COMMON_BEE_FIT_RETRY) {
+                    LOG_TRC("%s: retrying upstream fit from pristine inputs with "
+                            "measured Bee shortfall\n", __func__);
+                    continue;
+                }
+                if (action == COMMON_BEE_FIT_REPEATED_CANDIDATE) {
+                    throw common_params_fit_exception(
+                            "exact Bee validation rejected a repeated non-fitting candidate");
+                }
+                throw std::runtime_error("invalid Bee exact-fit shortfall or margin overflow");
+            }
+        }
+        LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
         status = COMMON_PARAMS_FIT_STATUS_FAILURE;
@@ -777,7 +1056,7 @@ enum common_params_fit_status common_fit_params(
         status = COMMON_PARAMS_FIT_STATUS_ERROR;
     }
     const int64_t t1_us = llama_time_us();
-    LOG_INF("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
+    LOG_TRC("%s: fitting params to free memory took %.2f seconds\n", __func__, (t1_us - t0_us) * 1e-6);
     return status;
 }
 
@@ -917,7 +1196,7 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
         }
     }
     for (const auto & td : table_data) {
-        LOG_INF(td[0].c_str(),
+        LOG_TRC(td[0].c_str(),
             __func__, td[1].c_str(), td[2].c_str(), td[3].c_str(), td[4].c_str(), td[5].c_str(),
             td[6].c_str(), td[7].c_str(), td[8].c_str());
     }
@@ -932,7 +1211,7 @@ void common_fit_print(
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
 
-    auto dmd = common_get_device_memory_data(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+    auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
     GGML_ASSERT(dmd.size() == devs.size() + 1);
 
     for (size_t id = 0; id < devs.size(); id++) {

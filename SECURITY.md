@@ -12,6 +12,9 @@
 
 ## Reporting a vulnerability
 
+> [!IMPORTANT]
+> The private security disclosure program is disabled until further notice. Please submit patches with fixes directly to the repo as public PRs. Emails will be ignored.
+
 If you have discovered a security vulnerability in this project that falls inside the [covered topics](#covered-topics), please report it privately. **Do not disclose it as a public issue.** This gives us time to work with you to fix the issue before public exposure, reducing the chance that the exploit will be used before a patch is released.
 
 Please disclose it as a private [security advisory](https://github.com/Anbeeld/beellama.cpp/security/advisories/new).
@@ -21,17 +24,17 @@ A team of volunteers on a reasonable-effort basis maintains this project. As suc
 > [!IMPORTANT]
 > For collaborators: review private security disclosures through this fork's GitHub security advisory workflow.
 
-## Requirements
+### Requirements
 
 Before submitting your report, ensure you meet the following requirements:
 
 - You have read this policy and fully understand it.
-- AI is only permitted in an assistive capacity. We do not accept reports that are written exclusively by AI; the reporter must understand and validate the finding.
+- AI is only permitted in an assistive capacity as stated in [AGENTS.md](AGENTS.md). We do not accept reports that are written exclusively by AI.
 - Your report must include a working Proof-of-Concept in the form of a script and/or attached files.
 
 Maintainers reserve the right to close the report if these requirements are not fulfilled.
 
-## Covered Topics
+### Covered Topics
 
 Only vulnerabilities that fall within these parts of the project are considered valid. For problems falling outside of this list, please report them as issues.
 
@@ -80,7 +83,7 @@ To protect sensitive data from potential leaks or unauthorized access, it is cru
 ### Untrusted environments or networks
 
 If you can't run your models in a secure and isolated environment or if it must be exposed to an untrusted network, make sure to take the following security precautions:
-* Do not expose the RPC backend, [rpc-server](tools/rpc), or [llama-server](tools/server) to an untrusted network without an isolation and access-control layer. The inherited upstream discussion at https://github.com/ggml-org/llama.cpp/pull/13061 is relevant background.
+* Do not use the RPC backend, [ggml-rpc-server](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) and [llama-server](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) functionality (see https://github.com/ggml-org/llama.cpp/pull/13061).
 * Confirm the hash of any downloaded artifact (e.g. pre-trained model weights) matches a known-good value.
 * Encrypt your data if sending it over the network.
 
